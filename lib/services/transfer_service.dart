@@ -58,6 +58,12 @@ class TransferService extends ChangeNotifier {
     return _connectedDevices.any((d) => d.ip == ip && d.isAuthorized);
   }
 
+  Future<void> addHistoryEntry(Map<String, dynamic> data) async {
+    await DatabaseService.instance.insertHistory(data);
+    _sessionHistory.insert(0, data);
+    notifyListeners();
+  }
+
   Future<void> startServer() async {
     if (_isRunning) return;
 

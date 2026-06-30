@@ -5,9 +5,16 @@ import 'package:window_manager/window_manager.dart';
 import 'package:network_info_plus/network_info_plus.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'dart:async';
+import 'dart:ui';
 import 'package:device_info_plus/device_info_plus.dart';
+import 'package:receive_sharing_intent/receive_sharing_intent.dart';
+
 import '../services/connection_client.dart';
 import '../services/network_service.dart';
+import '../services/transfer_service.dart';
+import '../core/widgets/notification_system.dart';
+import '../core/widgets/right_panel.dart';
+import '../core/widgets/send_files_page.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -18,18 +25,24 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen>
     with TickerProviderStateMixin, WindowListener {
-  static const Color _accentGreen = Color(0xFF336B4E);
-  static const Color _bgDark = Color(0xFF0D0D0D);
-  static const Color _textSecondary = Color(0xFFCCCCCC);
+  static const Color _accentGreen = Color(0xFF1ABC9C); // Plus vibrant pour le mode Pro
+  static const Color _bgDark = Color(0xFF0A0A0A);
+  static const Color _cardDark = Color(0xFF151515);
+  static const Color _textSecondary = Color(0xFFA0A0A0);
 
   String _localIP = 'Non connecté';
   String _connectedDeviceName = '';
   String _connectedDeviceIP = '';
   bool _isConnected = false;
+  int _currentPageIndex = 0;
+  
   final NetworkInfo _networkInfo = NetworkInfo();
   final Connectivity _connectivity = Connectivity();
   final DeviceInfoPlugin _deviceInfo = DeviceInfoPlugin();
   StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
+  StreamSubscription<ConnectedDevice>? _authSubscription;
+  StreamSubscription<List<SharedMediaFile>>? _intentDataStreamSubscription;
+  List<SharedMediaFile> _sharedFiles = [];
 
   late final AnimationController _headerController;
   late final AnimationController _contentController;
@@ -74,6 +87,98 @@ class _HomeScreenState extends State<HomeScreen>
     _connectivitySubscription = _connectivity.onConnectivityChanged.listen((_) {
       _checkConnectivity();
     });
+
+    _authSubscription = TransferService.instance.authRequests.listen(_handleAuthRequest);
+
+    // Initialisation Share Intent
+    if (Platform.isAndroid || Platform.isIOS) {
+      // Pour les partages entrants pendant que l'app est en mémoire
+      _intentDataStreamSubscription = ReceiveSharingIntent.instance.getMediaStream().listen(
+        (List<SharedMediaFile> value) {
+          _handleSharedFiles(value);
+        }, 
+        onError: (err) {
+          print("getIntentDataStream error: $err");
+        }
+      );
+
+      // Pour le partage au lancement de l'application
+      ReceiveSharingIntent.instance.getInitialMedia().then((List<SharedMediaFile> value) {
+        if (value.isNotEmpty) {
+          _handleSharedFiles(value);
+        }
+        ReceiveSharingIntent.instance.reset();
+      });
+    }
+  }
+
+  void _handleSharedFiles(List<SharedMediaFile> sharedFiles) {
+    if (sharedFiles.isEmpty) return;
+    setState(() {
+      _sharedFiles = sharedFiles;
+    });
+
+    if (_isConnected) {
+      // Si connecté, on va directement à la page d'envoi
+      setState(() {
+        _currentPageIndex = 1;
+      });
+      NotificationOverlay.success(
+        context,
+        title: 'Fichiers reçus',
+        message: 'Prêt à envoyer les fichiers partagés.',
+      );
+    } else {
+      // Sinon, on demande l'IP pour se connecter
+      _showIPInputDialog(isFromShare: true);
+    }
+  }
+
+  void _handleAuthRequest(ConnectedDevice device) {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        backgroundColor: _cardDark,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(20),
+          side: BorderSide(color: _accentGreen.withValues(alpha: 0.3), width: 1),
+        ),
+        title: Text(
+          'Demande de connexion',
+          style: GoogleFonts.inter(color: Colors.white, fontWeight: FontWeight.bold),
+        ),
+        content: Text(
+          'L\'appareil "${device.name}" (IP: ${device.ip}) souhaite se connecter.',
+          style: GoogleFonts.inter(color: _textSecondary),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              TransferService.instance.authorizeDevice(device.ip, false);
+              Navigator.pop(context);
+            },
+            child: Text('Refuser', style: GoogleFonts.inter(color: Colors.redAccent)),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              TransferService.instance.authorizeDevice(device.ip, true);
+              setState(() {
+                _isConnected = true;
+                _connectedDeviceName = device.name;
+                _connectedDeviceIP = device.ip;
+              });
+              Navigator.pop(context);
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: _accentGreen,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+            ),
+            child: Text('Accepter', style: GoogleFonts.inter(color: Colors.white, fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
   }
 
   void _startAnimations() async {
@@ -86,7 +191,6 @@ class _HomeScreenState extends State<HomeScreen>
   Future<void> _checkConnectivity() async {
     try {
       String? ip;
-
       if (Platform.isAndroid || Platform.isIOS) {
         final wifiName = await _networkInfo.getWifiName();
         final wifiIP = await _networkInfo.getWifiIP();
@@ -94,10 +198,8 @@ class _HomeScreenState extends State<HomeScreen>
           ip = wifiIP;
         }
       } else if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) {
-        // Pour PC, essayer d'obtenir l'IP locale via network_info_plus
         ip = await _networkInfo.getWifiIP();
       }
-
       if (mounted) {
         setState(() {
           _localIP = ip ?? 'Non connecté';
@@ -115,6 +217,8 @@ class _HomeScreenState extends State<HomeScreen>
   @override
   void dispose() {
     _connectivitySubscription?.cancel();
+    _authSubscription?.cancel();
+    _intentDataStreamSubscription?.cancel();
     if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) {
       windowManager.removeListener(this);
     }
@@ -133,55 +237,240 @@ class _HomeScreenState extends State<HomeScreen>
   @override
   Widget build(BuildContext context) {
     final sh = MediaQuery.of(context).size.height;
-    final pad = sh < 700
-        ? 16.0
-        : sh > 900
-        ? 24.0
-        : 20.0;
+    final sw = MediaQuery.of(context).size.width;
+    final isMobile = sw < 900 || Platform.isAndroid || Platform.isIOS;
+    final isPC = !isMobile;
 
     return Scaffold(
       backgroundColor: _bgDark,
       body: SafeArea(
-        child: Padding(
-          padding: EdgeInsets.symmetric(horizontal: pad),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              SizedBox(height: sh * 0.02),
-              SlideTransition(
-                position: _headerSlide,
-                child: FadeTransition(
-                  opacity: _headerFade,
-                  child: _buildTitle(),
+        child: Stack(
+          children: [
+            // Effets de lumière ambiante
+            Positioned(
+              top: -100,
+              right: -100,
+              child: Container(
+                width: 300,
+                height: 300,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: _accentGreen.withValues(alpha: 0.1),
+                ),
+                child: BackdropFilter(
+                  filter: ImageFilter.blur(sigmaX: 80, sigmaY: 80),
+                  child: Container(color: Colors.transparent),
                 ),
               ),
-              SizedBox(height: sh * 0.02),
-              Expanded(
-                child: FadeTransition(
-                  opacity: _contentFade,
-                  child: _buildContent(),
-                ),
-              ),
-            ],
-          ),
+            ),
+            
+            _currentPageIndex == 0
+                ? _buildMainPage(sh, sw, isPC, isMobile)
+                : _buildSendPage(),
+          ],
         ),
       ),
     );
   }
 
+  Widget _buildMainPage(double sh, double sw, bool isPC, bool isMobile) {
+    final pad = sh < 700 ? 16.0 : sh > 900 ? 24.0 : 20.0;
+
+    if (isPC) {
+      return Row(
+        children: [
+          Expanded(
+            child: Padding(
+              padding: EdgeInsets.symmetric(horizontal: pad),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  SizedBox(height: sh * 0.04),
+                  SlideTransition(
+                    position: _headerSlide,
+                    child: FadeTransition(
+                      opacity: _headerFade,
+                      child: _buildTitle(),
+                    ),
+                  ),
+                  SizedBox(height: sh * 0.04),
+                  Expanded(
+                    child: FadeTransition(
+                      opacity: _contentFade,
+                      child: _buildContent(),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          RightPanel(
+            localIP: _localIP,
+            isServerRunning: TransferService.instance.isRunning,
+            onToggleServer: _toggleServer,
+            onRefreshIP: _checkConnectivity,
+            connectedDeviceName: _isConnected ? _connectedDeviceName : null,
+            connectedDeviceIP: _isConnected ? _connectedDeviceIP : null,
+          ),
+        ],
+      );
+    } else {
+      return Padding(
+        padding: EdgeInsets.symmetric(horizontal: pad),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SizedBox(height: sh * 0.04),
+            SlideTransition(
+              position: _headerSlide,
+              child: FadeTransition(
+                opacity: _headerFade,
+                child: _buildTitle(),
+              ),
+            ),
+            SizedBox(height: sh * 0.04),
+            Expanded(
+              child: FadeTransition(
+                opacity: _contentFade,
+                child: _buildContent(),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+  }
+
+  Widget _buildSendPage() {
+    return SendFilesPage(
+      deviceName: _connectedDeviceName,
+      deviceIP: _connectedDeviceIP,
+      initialFiles: _sharedFiles.map((e) => e.path).toList(),
+      onSendFiles: () {
+        setState(() {
+          _currentPageIndex = 0;
+          _sharedFiles.clear(); // Reset shared files after sending
+        });
+      },
+    );
+  }
+
   Widget _buildTitle() {
-    return const SizedBox.shrink();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          'GoSend Pro',
+          style: GoogleFonts.outfit(
+            color: Colors.white,
+            fontSize: 32,
+            fontWeight: FontWeight.w800,
+            letterSpacing: 1.2,
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          'Partagez vos fichiers instantanément',
+          style: GoogleFonts.inter(
+            color: _accentGreen,
+            fontSize: 14,
+            fontWeight: FontWeight.w500,
+          ),
+        ),
+      ],
+    );
   }
 
   Widget _buildContent() {
     return Column(
       children: [
-        const SizedBox(height: 6),
         _buildModeButtons(),
-        const Spacer(),
+        const SizedBox(height: 16),
+        Expanded(child: _buildHistorySection()),
+        const SizedBox(height: 16),
         _buildNoDeviceBubble(),
         const SizedBox(height: 20),
       ],
+    );
+  }
+
+  Widget _buildHistorySection() {
+    return ListenableBuilder(
+      listenable: TransferService.instance,
+      builder: (context, _) {
+        final history = TransferService.instance.sessionHistory;
+        if (history.isEmpty) {
+          return Center(
+            child: Text(
+              'Aucun transfert récent',
+              style: GoogleFonts.inter(color: _textSecondary.withValues(alpha: 0.5)),
+            ),
+          );
+        }
+        return Container(
+          decoration: BoxDecoration(
+            color: Colors.white.withValues(alpha: 0.02),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: Colors.white.withValues(alpha: 0.05)),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Text(
+                  'Historique récent',
+                  style: GoogleFonts.outfit(
+                    color: Colors.white,
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              Expanded(
+                child: ListView.builder(
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  itemCount: history.length,
+                  itemBuilder: (context, index) {
+                    final item = history[index];
+                    final isReceived = item['type'] == 'received';
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 12),
+                      child: Row(
+                        children: [
+                          Icon(
+                            isReceived ? Icons.download_rounded : Icons.upload_rounded,
+                            color: isReceived ? _accentGreen : Colors.blueAccent,
+                            size: 20,
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  item['filename'] ?? 'Fichier inconnu',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: GoogleFonts.inter(color: Colors.white, fontSize: 13),
+                                ),
+                                Text(
+                                  '${item['timestamp']} • ${item['status']}',
+                                  style: GoogleFonts.inter(color: _textSecondary, fontSize: 11),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        );
+      },
     );
   }
 
@@ -192,166 +481,271 @@ class _HomeScreenState extends State<HomeScreen>
           children: [
             Expanded(
               child: _discreteButton(
-                Icons.link_rounded,
+                Icons.radar_rounded,
                 'Connecter',
+                'Chercher un appareil',
                 _showConnectionDialog,
+                enabled: !_isConnected,
+              ),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+              child: _discreteButton(
+                Icons.send_rounded,
+                'Envoyer',
+                'Transférer des fichiers',
+                _isConnected
+                    ? () {
+                        setState(() {
+                          _currentPageIndex = 1;
+                        });
+                      }
+                    : null,
+                enabled: _isConnected,
               ),
             ),
           ],
         ),
-        const SizedBox(height: 8),
+        const SizedBox(height: 16),
+        Row(
+          children: [
+            Expanded(
+              child: _discreteButton(
+                Icons.router_rounded,
+                'Mode Serveur',
+                'Écouter les connexions',
+                _toggleServer,
+                enabled: true,
+                isActive: TransferService.instance.isRunning,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 24),
         _buildIPDisplay(),
       ],
     );
   }
 
-  Widget _discreteButton(IconData icon, String title, VoidCallback onTap) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 12),
-        decoration: BoxDecoration(
-          color: Colors.white.withValues(alpha: 0.05),
-          borderRadius: BorderRadius.circular(10),
-        ),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(icon, color: _accentGreen, size: 18),
-            const SizedBox(width: 6),
-            Text(
-              title,
-              style: GoogleFonts.inter(
-                color: Colors.white,
-                fontSize: 14,
-                fontWeight: FontWeight.w500,
+  Widget _discreteButton(
+    IconData icon,
+    String title,
+    String subtitle,
+    VoidCallback? onTap, {
+    bool enabled = true,
+    bool isActive = false,
+  }) {
+    final color = !enabled ? Colors.grey.withValues(alpha: 0.5) : (isActive ? _accentGreen : Colors.white);
+
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 300),
+      curve: Curves.easeInOut,
+      child: GestureDetector(
+        onTap: enabled ? onTap : null,
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(20),
+          child: BackdropFilter(
+            filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+            child: Container(
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: isActive
+                      ? [
+                          _accentGreen.withValues(alpha: 0.3),
+                          _accentGreen.withValues(alpha: 0.1),
+                        ]
+                      : [
+                          Colors.white.withValues(alpha: 0.08),
+                          Colors.white.withValues(alpha: 0.03),
+                        ],
+                ),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(
+                  color: isActive
+                      ? _accentGreen.withValues(alpha: 0.5)
+                      : Colors.white.withValues(alpha: 0.1),
+                  width: 1.5,
+                ),
+                boxShadow: isActive
+                    ? [
+                        BoxShadow(
+                          color: _accentGreen.withValues(alpha: 0.2),
+                          blurRadius: 20,
+                          spreadRadius: 2,
+                        )
+                      ]
+                    : [],
+              ),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: color.withValues(alpha: 0.15),
+                      shape: BoxShape.circle,
+                    ),
+                    child: Icon(icon, color: color, size: 24),
+                  ),
+                  const SizedBox(height: 16),
+                  Text(
+                    title,
+                    style: GoogleFonts.outfit(
+                      color: color,
+                      fontSize: 18,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    subtitle,
+                    style: GoogleFonts.inter(
+                      color: color.withValues(alpha: 0.7),
+                      fontSize: 12,
+                    ),
+                  ),
+                ],
               ),
             ),
-          ],
+          ),
         ),
       ),
     );
   }
 
   Widget _buildIPDisplay() {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.03),
-        borderRadius: BorderRadius.circular(10),
-      ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(
-            Icons.wifi_rounded,
-            color: _localIP != 'Non connecté'
-                ? _accentGreen
-                : _textSecondary.withValues(alpha: 0.5),
-            size: 16,
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(16),
+      child: BackdropFilter(
+        filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+          decoration: BoxDecoration(
+            color: Colors.white.withValues(alpha: 0.03),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: Colors.white.withValues(alpha: 0.05)),
           ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              _localIP,
-              style: GoogleFonts.inter(
-                color: _localIP != 'Non connecté'
-                    ? Colors.white
-                    : _textSecondary.withValues(alpha: 0.5),
-                fontSize: 13,
-                fontWeight: FontWeight.w400,
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: _localIP != 'Non connecté' 
+                    ? _accentGreen.withValues(alpha: 0.2) 
+                    : Colors.white.withValues(alpha: 0.05),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(
+                  Icons.wifi_rounded,
+                  color: _localIP != 'Non connecté'
+                      ? _accentGreen
+                      : _textSecondary.withValues(alpha: 0.5),
+                  size: 18,
+                ),
               ),
-              textAlign: TextAlign.center,
-            ),
+              const SizedBox(width: 16),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Mon IP Locale',
+                      style: GoogleFonts.inter(
+                        color: _textSecondary.withValues(alpha: 0.8),
+                        fontSize: 11,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      _localIP,
+                      style: GoogleFonts.outfit(
+                        color: _localIP != 'Non connecté'
+                            ? Colors.white
+                            : _textSecondary.withValues(alpha: 0.5),
+                        fontSize: 15,
+                        fontWeight: FontWeight.w600,
+                        letterSpacing: 1.1,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              GestureDetector(
+                onTap: _checkConnectivity,
+                child: Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.05),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Icon(
+                    Icons.refresh_rounded,
+                    color: Colors.white,
+                    size: 18,
+                  ),
+                ),
+              ),
+            ],
           ),
-          GestureDetector(
-            onTap: _checkConnectivity,
-            child: Icon(
-              Icons.refresh_rounded,
-              color: _textSecondary.withValues(alpha: 0.5),
-              size: 16,
-            ),
-          ),
-        ],
+        ),
       ),
     );
   }
 
   void _showConnectionDialog() {
     final isMobile = Platform.isAndroid || Platform.isIOS;
-
     if (isMobile) {
       showModalBottomSheet(
         context: context,
         backgroundColor: Colors.transparent,
-        builder: (context) => Container(
+        builder: (context) => _buildConnectionDialogContent(),
+      );
+    } else {
+      showDialog(
+        context: context,
+        builder: (context) => Dialog(
+          backgroundColor: Colors.transparent,
+          child: _buildConnectionDialogContent(),
+        ),
+      );
+    }
+  }
+
+  Widget _buildConnectionDialogContent() {
+    return ClipRRect(
+      borderRadius: const BorderRadius.vertical(top: Radius.circular(24), bottom: Radius.circular(24)),
+      child: BackdropFilter(
+        filter: ImageFilter.blur(sigmaX: 15, sigmaY: 15),
+        child: Container(
           decoration: BoxDecoration(
-            color: _bgDark,
-            borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+            color: _cardDark.withValues(alpha: 0.8),
+            borderRadius: const BorderRadius.vertical(top: Radius.circular(24), bottom: Radius.circular(24)),
+            border: Border.all(color: Colors.white.withValues(alpha: 0.1)),
           ),
-          padding: EdgeInsets.all(24),
+          padding: const EdgeInsets.all(24),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
-                'Mode de connexion',
-                style: GoogleFonts.inter(
+                'Connecter un appareil',
+                style: GoogleFonts.outfit(
                   color: Colors.white,
-                  fontSize: 20,
-                  fontWeight: FontWeight.w600,
+                  fontSize: 22,
+                  fontWeight: FontWeight.w700,
                 ),
               ),
-              SizedBox(height: 24),
+              const SizedBox(height: 24),
               _connectionOption(
                 Icons.wifi_rounded,
-                'Par WiFi',
-                'Les deux appareils sont sur le même réseau WiFi',
-                () {
-                  Navigator.pop(context);
-                  _showIPInputDialog();
-                },
-                showIconInTitle: true,
-              ),
-              SizedBox(height: 12),
-              _connectionOption(
-                Icons.router_rounded,
-                'Par Hotspot',
-                'Se connecter au hotspot de l\'un ou l\'autre appareil',
-                () {
-                  Navigator.pop(context);
-                },
-                showIconInTitle: true,
-              ),
-              SizedBox(height: 16),
-            ],
-          ),
-        ),
-      );
-    } else {
-      showDialog(
-        context: context,
-        builder: (context) => AlertDialog(
-          backgroundColor: _bgDark,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(20),
-          ),
-          title: Text(
-            'Mode de connexion',
-            style: GoogleFonts.inter(
-              color: Colors.white,
-              fontSize: 20,
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              _connectionOption(
-                Icons.wifi_rounded,
-                'Par WiFi',
-                'Les deux appareils sont sur le même réseau WiFi',
+                'Connexion WiFi (IP)',
+                'Connectez-vous via l\'adresse IP locale',
                 () {
                   Navigator.pop(context);
                   _showIPInputDialog();
@@ -360,9 +754,9 @@ class _HomeScreenState extends State<HomeScreen>
               ),
               const SizedBox(height: 12),
               _connectionOption(
-                Icons.router_rounded,
-                'Par Hotspot',
-                'Se connecter au hotspot de l\'un ou l\'autre appareil',
+                Icons.qr_code_rounded,
+                'Scanner un Code QR',
+                'Connexion rapide via appareil photo',
                 () {
                   Navigator.pop(context);
                 },
@@ -371,240 +765,139 @@ class _HomeScreenState extends State<HomeScreen>
             ],
           ),
         ),
-      );
-    }
+      ),
+    );
   }
 
-  void _showIPInputDialog() {
+  void _showIPInputDialog({bool isFromShare = false}) {
     final controller = TextEditingController();
-    final isMobile = Platform.isAndroid || Platform.isIOS;
-
-    if (isMobile) {
-      showModalBottomSheet(
-        context: context,
+    showDialog(
+      context: context,
+      builder: (context) => Dialog(
         backgroundColor: Colors.transparent,
-        isScrollControlled: true,
-        builder: (context) => Container(
-          decoration: BoxDecoration(
-            color: _bgDark,
-            borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-          ),
-          padding: EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                'Adresse IP du destinataire',
-                style: GoogleFonts.inter(
-                  color: Colors.white,
-                  fontSize: 20,
-                  fontWeight: FontWeight.w600,
-                ),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(24),
+          child: BackdropFilter(
+            filter: ImageFilter.blur(sigmaX: 15, sigmaY: 15),
+            child: Container(
+              decoration: BoxDecoration(
+                color: _cardDark.withValues(alpha: 0.8),
+                borderRadius: BorderRadius.circular(24),
+                border: Border.all(color: Colors.white.withValues(alpha: 0.1)),
               ),
-              SizedBox(height: 16),
-              Text(
-                'Entrez l\'adresse IP de l\'appareil auquel vous souhaitez vous connecter',
-                style: GoogleFonts.inter(color: _textSecondary, fontSize: 14),
-              ),
-              SizedBox(height: 20),
-              TextField(
-                controller: controller,
-                keyboardType: TextInputType.number,
-                style: GoogleFonts.inter(color: Colors.white, fontSize: 16),
-                decoration: InputDecoration(
-                  hintText: '192.168.1.100',
-                  hintStyle: GoogleFonts.inter(
-                    color: _textSecondary.withValues(alpha: 0.5),
-                  ),
-                  filled: true,
-                  fillColor: Colors.white.withValues(alpha: 0.05),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(10),
-                    borderSide: BorderSide.none,
-                  ),
-                ),
-              ),
-              SizedBox(height: 20),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton(
-                  onPressed: () {
-                    if (controller.text.isNotEmpty) {
-                      Navigator.pop(context);
-                      _sendConnectionRequest(controller.text);
-                    }
-                  },
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: _accentGreen,
-                    padding: EdgeInsets.symmetric(vertical: 14),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                  ),
-                  child: Text(
-                    'Connecter',
-                    style: GoogleFonts.inter(
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Adresse IP',
+                    style: GoogleFonts.outfit(
                       color: Colors.white,
-                      fontSize: 16,
-                      fontWeight: FontWeight.w600,
+                      fontSize: 22,
+                      fontWeight: FontWeight.w700,
                     ),
                   ),
-                ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Entrez l\'adresse IP de l\'appareil cible',
+                    style: GoogleFonts.inter(color: _textSecondary, fontSize: 14),
+                  ),
+                  const SizedBox(height: 20),
+                  TextField(
+                    controller: controller,
+                    keyboardType: TextInputType.number,
+                    style: GoogleFonts.inter(color: Colors.white, fontSize: 16),
+                    decoration: InputDecoration(
+                      hintText: 'ex: 192.168.1.10',
+                      hintStyle: GoogleFonts.inter(
+                        color: _textSecondary.withValues(alpha: 0.5),
+                      ),
+                      filled: true,
+                      fillColor: Colors.white.withValues(alpha: 0.05),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: BorderSide.none,
+                      ),
+                      focusedBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: BorderSide(color: _accentGreen.withValues(alpha: 0.5)),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 24),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: [
+                      TextButton(
+                        onPressed: () => Navigator.pop(context),
+                        child: Text(
+                          'Annuler',
+                          style: GoogleFonts.inter(color: _textSecondary),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      ElevatedButton(
+                        onPressed: () {
+                          if (controller.text.isNotEmpty) {
+                            Navigator.pop(context);
+                            _sendConnectionRequest(controller.text, isFromShare: isFromShare);
+                          }
+                        },
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: _accentGreen,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                        ),
+                        child: Text(
+                          'Connecter',
+                          style: GoogleFonts.inter(
+                            color: Colors.white,
+                            fontSize: 15,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
               ),
-              SizedBox(height: 16),
-            ],
+            ),
           ),
         ),
-      );
-    } else {
-      showDialog(
-        context: context,
-        builder: (context) => AlertDialog(
-          backgroundColor: _bgDark,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(20),
-          ),
-          title: Text(
-            'Adresse IP du destinataire',
-            style: GoogleFonts.inter(
-              color: Colors.white,
-              fontSize: 20,
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                'Entrez l\'adresse IP de l\'appareil auquel vous souhaitez vous connecter',
-                style: GoogleFonts.inter(color: _textSecondary, fontSize: 14),
-              ),
-              const SizedBox(height: 20),
-              TextField(
-                controller: controller,
-                keyboardType: TextInputType.number,
-                style: GoogleFonts.inter(color: Colors.white, fontSize: 16),
-                decoration: InputDecoration(
-                  hintText: '192.168.1.100',
-                  hintStyle: GoogleFonts.inter(
-                    color: _textSecondary.withValues(alpha: 0.5),
-                  ),
-                  filled: true,
-                  fillColor: Colors.white.withValues(alpha: 0.05),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(10),
-                    borderSide: BorderSide.none,
-                  ),
-                ),
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: Text(
-                'Annuler',
-                style: GoogleFonts.inter(color: _textSecondary),
-              ),
-            ),
-            ElevatedButton(
-              onPressed: () {
-                if (controller.text.isNotEmpty) {
-                  Navigator.pop(context);
-                  _sendConnectionRequest(controller.text);
-                }
-              },
-              style: ElevatedButton.styleFrom(
-                backgroundColor: _accentGreen,
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(10),
-                ),
-              ),
-              child: Text(
-                'Connecter',
-                style: GoogleFonts.inter(
-                  color: Colors.white,
-                  fontSize: 16,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-            ),
-          ],
-        ),
-      );
-    }
+      ),
+    );
   }
 
-  Future<void> _sendConnectionRequest(String targetIP) async {
-    // Vérifier si l'IP est valide
+  Future<void> _sendConnectionRequest(String targetIP, {bool isFromShare = false}) async {
     if (!NetworkService.isValidIP(targetIP)) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Adresse IP invalide'),
-            backgroundColor: Colors.redAccent,
-          ),
-        );
-      }
+      await NotificationOverlay.error(
+        context,
+        title: 'IP invalide',
+        message: 'Veuillez entrer une adresse IP valide',
+      );
       return;
     }
 
-    // Vérifier si l'appareil est accessible
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Vérification de l\'appareil...'),
-          backgroundColor: _accentGreen,
-        ),
-      );
-    }
+    await NotificationOverlay.info(
+      context,
+      title: 'Connexion en cours',
+      message: 'Recherche de l\'appareil...',
+    );
 
     final isReachable = await ConnectionClient.isDeviceReachable(targetIP);
     if (!isReachable) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Appareil non accessible ou hors ligne'),
-            backgroundColor: Colors.redAccent,
-          ),
-        );
-      }
+      await NotificationOverlay.error(
+        context,
+        title: 'Appareil introuvable',
+        message: 'L\'appareil ne répond pas ou a refusé la connexion.',
+      );
       return;
     }
 
-    // Obtenir le nom de l'appareil
-    String deviceName = 'Appareil';
-    try {
-      if (Platform.isAndroid) {
-        final androidInfo = await _deviceInfo.androidInfo;
-        deviceName = androidInfo.model;
-      } else if (Platform.isIOS) {
-        final iosInfo = await _deviceInfo.iosInfo;
-        deviceName = iosInfo.model;
-      } else if (Platform.isWindows) {
-        final windowsInfo = await _deviceInfo.windowsInfo;
-        deviceName = windowsInfo.computerName;
-      } else if (Platform.isMacOS) {
-        final macInfo = await _deviceInfo.macOsInfo;
-        deviceName = macInfo.computerName;
-      } else if (Platform.isLinux) {
-        deviceName = 'PC Linux';
-      }
-    } catch (e) {
-      deviceName = 'Appareil';
-    }
-
-    // Envoyer la demande de connexion réelle
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Envoi de la demande de connexion...'),
-          backgroundColor: _accentGreen,
-        ),
-      );
-    }
+    String deviceName = await TransferService.instance.getDeviceName();
 
     final authorized = await ConnectionClient.sendConnectionRequest(
       targetIP,
@@ -617,20 +910,21 @@ class _HomeScreenState extends State<HomeScreen>
           _connectedDeviceIP = targetIP;
           _connectedDeviceName = 'Appareil distant';
           _isConnected = true;
+          if (isFromShare) {
+            _currentPageIndex = 1;
+          }
         });
 
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Connexion acceptée !'),
-            backgroundColor: _accentGreen,
-          ),
+        await NotificationOverlay.success(
+          context,
+          title: 'Connecté',
+          message: 'L\'appareil a accepté la connexion.',
         );
       } else {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Connexion refusée'),
-            backgroundColor: Colors.redAccent,
-          ),
+        await NotificationOverlay.error(
+          context,
+          title: 'Refusé',
+          message: 'L\'appareil a refusé la connexion',
         );
       }
     }
@@ -641,14 +935,34 @@ class _HomeScreenState extends State<HomeScreen>
       _isConnected = false;
       _connectedDeviceName = '';
       _connectedDeviceIP = '';
+      _currentPageIndex = 0;
     });
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text('Déconnecté'),
-        backgroundColor: Colors.redAccent,
-      ),
+    NotificationOverlay.info(
+      context,
+      title: 'Déconnecté',
+      message: 'Connexion terminée.',
     );
+  }
+
+  void _toggleServer() async {
+    if (TransferService.instance.isRunning) {
+      await TransferService.instance.stopServer();
+      setState(() {});
+      await NotificationOverlay.warning(
+        context,
+        title: 'Serveur arrêté',
+        message: 'L\'écoute réseau est désactivée.',
+      );
+    } else {
+      await TransferService.instance.startServer();
+      setState(() {});
+      await NotificationOverlay.success(
+        context,
+        title: 'Serveur en ligne',
+        message: 'Prêt à recevoir des connexions sur $_localIP:8765',
+      );
+    }
   }
 
   Widget _connectionOption(
@@ -661,43 +975,36 @@ class _HomeScreenState extends State<HomeScreen>
     return GestureDetector(
       onTap: onTap,
       child: Container(
-        padding: EdgeInsets.all(16),
+        padding: const EdgeInsets.all(16),
         decoration: BoxDecoration(
           color: Colors.white.withValues(alpha: 0.05),
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: Colors.white.withValues(alpha: 0.02)),
         ),
         child: Row(
           children: [
-            if (!showIconInTitle)
-              Container(
-                padding: EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                  color: _accentGreen.withValues(alpha: 0.15),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: Icon(icon, color: _accentGreen, size: 20),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: _accentGreen.withValues(alpha: 0.15),
+                borderRadius: BorderRadius.circular(12),
               ),
-            if (!showIconInTitle) SizedBox(width: 12),
+              child: Icon(icon, color: _accentGreen, size: 24),
+            ),
+            const SizedBox(width: 16),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Row(
-                    children: [
-                      if (showIconInTitle)
-                        Icon(icon, color: _accentGreen, size: 20),
-                      if (showIconInTitle) SizedBox(width: 8),
-                      Text(
-                        title,
-                        style: GoogleFonts.inter(
-                          color: Colors.white,
-                          fontSize: 15,
-                          fontWeight: FontWeight.w500,
-                        ),
-                      ),
-                    ],
+                  Text(
+                    title,
+                    style: GoogleFonts.outfit(
+                      color: Colors.white,
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600,
+                    ),
                   ),
-                  SizedBox(height: 2),
+                  const SizedBox(height: 4),
                   Text(
                     desc,
                     style: GoogleFonts.inter(
@@ -709,9 +1016,9 @@ class _HomeScreenState extends State<HomeScreen>
               ),
             ),
             Icon(
-              Icons.arrow_forward_ios_rounded,
+              Icons.chevron_right_rounded,
               color: _textSecondary.withValues(alpha: 0.5),
-              size: 14,
+              size: 20,
             ),
           ],
         ),
@@ -720,47 +1027,62 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   Widget _buildNoDeviceBubble() {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 300),
+      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
       decoration: BoxDecoration(
-        color: _isConnected
-            ? _accentGreen.withValues(alpha: 0.15)
-            : Colors.white.withValues(alpha: 0.05),
-        borderRadius: BorderRadius.circular(20),
+        gradient: LinearGradient(
+          colors: _isConnected
+              ? [
+                  _accentGreen.withValues(alpha: 0.2),
+                  _accentGreen.withValues(alpha: 0.05),
+                ]
+              : [
+                  Colors.white.withValues(alpha: 0.05),
+                  Colors.white.withValues(alpha: 0.02),
+                ],
+        ),
+        borderRadius: BorderRadius.circular(30),
+        border: Border.all(
+          color: _isConnected
+              ? _accentGreen.withValues(alpha: 0.3)
+              : Colors.white.withValues(alpha: 0.05),
+        ),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
           Icon(
-            _isConnected
-                ? Icons.check_circle_rounded
-                : Icons.devices_other_rounded,
-            color: _isConnected
-                ? _accentGreen
-                : _textSecondary.withValues(alpha: 0.5),
+            _isConnected ? Icons.link_rounded : Icons.wifi_off_rounded,
+            color: _isConnected ? _accentGreen : _textSecondary.withValues(alpha: 0.5),
             size: 18,
           ),
-          const SizedBox(width: 8),
+          const SizedBox(width: 10),
           Text(
             _isConnected
-                ? 'Connecté: $_connectedDeviceName ($_connectedDeviceIP)'
+                ? '$_connectedDeviceName'
                 : 'Aucun appareil connecté',
             style: GoogleFonts.inter(
-              color: _isConnected
-                  ? _accentGreen
-                  : _textSecondary.withValues(alpha: 0.6),
+              color: _isConnected ? Colors.white : _textSecondary.withValues(alpha: 0.8),
               fontSize: 13,
-              fontWeight: FontWeight.w400,
+              fontWeight: FontWeight.w500,
             ),
           ),
           if (_isConnected) ...[
-            const SizedBox(width: 12),
+            const SizedBox(width: 16),
             GestureDetector(
               onTap: _disconnect,
-              child: Icon(
-                Icons.close_rounded,
-                color: _textSecondary.withValues(alpha: 0.5),
-                size: 18,
+              child: Container(
+                padding: const EdgeInsets.all(4),
+                decoration: BoxDecoration(
+                  color: Colors.redAccent.withValues(alpha: 0.15),
+                  shape: BoxShape.circle,
+                ),
+                child: const Icon(
+                  Icons.close_rounded,
+                  color: Colors.redAccent,
+                  size: 14,
+                ),
               ),
             ),
           ],
