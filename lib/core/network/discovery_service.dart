@@ -6,11 +6,15 @@ import '../../models/device.dart';
 
 class DiscoveryService {
   static const int broadcastPort = 50000;
+  static const Duration deviceTimeout = Duration(seconds: 10);
   RawDatagramSocket? _socket;
   Timer? _broadcastTimer;
-  
+  Timer? _cleanupTimer;
+  bool isDiscoverable = true;
+
   final ValueNotifier<List<Device>> discoveredDevices = ValueNotifier([]);
   final Map<String, Device> _devicesMap = {};
+  final Map<String, DateTime> _lastSeenMap = {};
 
   final String localDeviceId;
   final String localDeviceName;
@@ -24,7 +28,10 @@ class DiscoveryService {
 
   Future<void> startDiscovery() async {
     try {
-      _socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, broadcastPort);
+      _socket = await RawDatagramSocket.bind(
+        InternetAddress.anyIPv4,
+        broadcastPort,
+      );
       _socket?.broadcastEnabled = true;
 
       _socket?.listen((RawSocketEvent event) {
@@ -37,6 +44,7 @@ class DiscoveryService {
       });
 
       _startBroadcasting();
+      _startCleanupTimer();
       debugPrint('DiscoveryService started on port $broadcastPort');
     } catch (e) {
       debugPrint('Error starting DiscoveryService: $e');
@@ -45,6 +53,8 @@ class DiscoveryService {
 
   void _startBroadcasting() {
     _broadcastTimer = Timer.periodic(const Duration(seconds: 2), (timer) {
+      if (!isDiscoverable) return;
+      
       final message = jsonEncode({
         'id': localDeviceId,
         'name': localDeviceName,
@@ -57,12 +67,16 @@ class DiscoveryService {
     });
   }
 
+  void toggleDiscoverability() {
+    isDiscoverable = !isDiscoverable;
+  }
+
   void _handleIncomingDatagram(Datagram datagram) {
     try {
       final message = utf8.decode(datagram.data);
       final data = jsonDecode(message);
 
-      if (data['id'] == localDeviceId) return; // Ignore own broadcast
+      if (data['id'] == localDeviceId) return;
 
       final device = Device(
         id: data['id'],
@@ -72,10 +86,11 @@ class DiscoveryService {
         os: data['os'] ?? 'unknown',
       );
 
-      if (!_devicesMap.containsKey(device.id)) {
-        _devicesMap[device.id] = device;
-        _updateDiscoveredDevices();
-      }
+      // Utiliser IP+nom comme clé unique pour éviter les doublons
+      final uniqueKey = '${device.ip}_${device.name}';
+      _devicesMap[uniqueKey] = device;
+      _lastSeenMap[uniqueKey] = DateTime.now();
+      _updateDiscoveredDevices();
     } catch (e) {
       debugPrint('Error parsing datagram: $e');
     }
@@ -85,10 +100,39 @@ class DiscoveryService {
     discoveredDevices.value = _devicesMap.values.toList();
   }
 
+  void _startCleanupTimer() {
+    _cleanupTimer = Timer.periodic(const Duration(seconds: 5), (timer) {
+      _cleanupInactiveDevices();
+    });
+  }
+
+  void _cleanupInactiveDevices() {
+    final now = DateTime.now();
+    final toRemove = <String>[];
+
+    for (final entry in _lastSeenMap.entries) {
+      if (now.difference(entry.value) > deviceTimeout) {
+        toRemove.add(entry.key);
+      }
+    }
+
+    for (final deviceId in toRemove) {
+      _devicesMap.remove(deviceId);
+      _lastSeenMap.remove(deviceId);
+      debugPrint('Removed inactive device: $deviceId');
+    }
+
+    if (toRemove.isNotEmpty) {
+      _updateDiscoveredDevices();
+    }
+  }
+
   void stopDiscovery() {
     _broadcastTimer?.cancel();
+    _cleanupTimer?.cancel();
     _socket?.close();
     _devicesMap.clear();
+    _lastSeenMap.clear();
     _updateDiscoveredDevices();
     debugPrint('DiscoveryService stopped');
   }

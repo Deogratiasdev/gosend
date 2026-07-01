@@ -5,19 +5,32 @@ import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:uuid/uuid.dart';
+import '../../core/db/history_db.dart';
+import '../../core/network/discovery_service.dart';
 import '../../core/network/webrtc_service.dart';
+import '../../core/notifications/notification_service.dart';
+import '../../core/transfer/file_receiver.dart';
 import '../../models/device.dart';
+import '../../models/history_item.dart';
+import '../../models/transfer_request.dart';
+import 'history_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   final List<Device> devices;
   final VoidCallback onRefresh;
   final String localDeviceName;
+  final String localIpAddress;
+  final DiscoveryService discoveryService;
 
   const HomeScreen({
     super.key,
     required this.devices,
     required this.onRefresh,
     required this.localDeviceName,
+    required this.localIpAddress,
+    required this.discoveryService,
   });
 
   @override
@@ -36,6 +49,14 @@ class _HomeScreenState extends State<HomeScreen>
   late AnimationController _pulseController;
   late Animation<double> _pulseAnimation;
   final WebRTCService _webRTCService = WebRTCService();
+  final FileReceiver _fileReceiver = FileReceiver();
+  final List<TransferRequest> _incomingRequests = [];
+  TransferRequest? _currentReceivingRequest;
+  String? _currentTransferId;
+  bool _isPaused = false;
+  bool _isCancelled = false;
+  final TextEditingController _deviceSearchController = TextEditingController();
+  String _deviceSearchQuery = '';
 
   @override
   void initState() {
@@ -48,24 +69,211 @@ class _HomeScreenState extends State<HomeScreen>
       CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
     );
     _webRTCService.startSignalingServer();
+    _webRTCService.onTransferRequestReceived = _handleTransferRequest;
+    _webRTCService.onTransferResponse = _handleTransferResponse;
+    _webRTCService.onDataReceived = _handleDataReceived;
+    _webRTCService.onControlMessage = _handleControlMessage;
+    _deviceSearchController.addListener(() {
+      setState(() => _deviceSearchQuery = _deviceSearchController.text.toLowerCase());
+    });
   }
 
   @override
   void dispose() {
     _pulseController.dispose();
+    _deviceSearchController.dispose();
     _webRTCService.dispose();
     super.dispose();
   }
 
-  Future<void> _pickFiles() async {
-    final result = await FilePicker.platform.pickFiles(allowMultiple: true);
-    if (result != null) {
+  void _handleTransferRequest(TransferRequest request) {
+    setState(() {
+      _incomingRequests.add(request);
+    });
+    _showTransferRequestDialog(request);
+  }
+
+  void _handleTransferResponse(String requestId, bool accepted) {
+    if (accepted) {
+      _currentTransferId = requestId;
+      _startFileTransfer();
+    } else {
       setState(() {
-        _selectedFiles = result.paths
-            .whereType<String>()
-            .map(File.new)
-            .toList();
+        _statusMessage = 'Transfert refusé';
+        _isTransferring = false;
       });
+    }
+  }
+
+  void _handleControlMessage(String requestId, String action) {
+    if (action == 'pause') {
+      setState(() => _isPaused = true);
+    } else if (action == 'resume') {
+      setState(() => _isPaused = false);
+    } else if (action == 'cancel') {
+      setState(() {
+        _isCancelled = true;
+        _isTransferring = false;
+        _statusMessage = 'Transfert annulé par l\'autre appareil';
+        if (_currentReceivingRequest != null) {
+          _fileReceiver.cancelTransfer(requestId);
+          _currentReceivingRequest = null;
+        }
+      });
+    }
+  }
+
+  void _handleDataReceived(Uint8List data) {
+    if (_currentReceivingRequest != null) {
+      final progress = _fileReceiver.receiveChunk(
+        _currentReceivingRequest!.id,
+        data,
+      );
+      setState(() {
+        _progress = progress;
+        _statusMessage =
+            'Réception : ${_currentReceivingRequest!.files.first.name}';
+      });
+
+      if (progress >= 1.0) {
+        _saveReceivedFile();
+      }
+    }
+  }
+
+  Future<void> _saveReceivedFile() async {
+    if (_currentReceivingRequest == null) return;
+
+    final filePath = await _fileReceiver.saveFile(_currentReceivingRequest!.id);
+    if (filePath != null) {
+      setState(() {
+        _statusMessage = '✅ Fichier reçu : $filePath';
+        _progress = 0.0;
+      });
+      _showSnack('✅ Fichier enregistré avec succès !');
+      
+      NotificationService().showNotification(
+        title: 'Transfert terminé',
+        body: 'Fichier ${_currentReceivingRequest!.files.first.name} reçu',
+      );
+      
+      final historyItem = HistoryItem(
+        id: const Uuid().v4(),
+        type: 'receive',
+        peerName: _currentReceivingRequest!.senderName,
+        fileName: _currentReceivingRequest!.files.first.name,
+        filePath: filePath,
+        size: _currentReceivingRequest!.files.first.size,
+        timestamp: DateTime.now().millisecondsSinceEpoch,
+        status: 'completed',
+      );
+      HistoryDB.instance.insertItem(historyItem);
+      
+      _currentReceivingRequest = null;
+    }
+  }
+
+  void _showTransferRequestDialog(TransferRequest request) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Demande de transfert'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('De: ${request.senderName}'),
+            const SizedBox(height: 8),
+            const Text('Fichiers:'),
+            ...request.files.map(
+              (file) => Padding(
+                padding: const EdgeInsets.only(left: 16, top: 4),
+                child: Text('• ${file.name} (${_formatSize(file.size)})'),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              _webRTCService.sendTransferResponse(request.id, false);
+              setState(() {
+                _incomingRequests.remove(request);
+              });
+            },
+            child: const Text('Refuser'),
+          ),
+          TextButton(
+            onPressed: () async {
+              Navigator.pop(context);
+              await _fileReceiver.startTransfer(request.id, request);
+              _webRTCService.sendTransferResponse(request.id, true);
+              setState(() {
+                _incomingRequests.remove(request);
+                _currentReceivingRequest = request;
+                _isCancelled = false;
+                _isPaused = false;
+                _isTransferring = true;
+                _statusMessage = 'Réception en cours...';
+              });
+            },
+            child: const Text('Accepter'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _pickFiles() async {
+    if (MediaQuery.of(context).size.width <= 800 && Platform.isAndroid || Platform.isIOS) {
+      showModalBottomSheet(
+        context: context,
+        builder: (context) => SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ListTile(
+                leading: const Icon(Icons.photo_library),
+                title: const Text('Images / Vidéos (Galerie)'),
+                onTap: () async {
+                  Navigator.pop(context);
+                  final picker = ImagePicker();
+                  final pickedFiles = await picker.pickMultipleMedia();
+                  if (pickedFiles.isNotEmpty) {
+                    setState(() {
+                      _selectedFiles.addAll(pickedFiles.map((x) => File(x.path)));
+                    });
+                  }
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.folder),
+                title: const Text('Fichiers'),
+                onTap: () async {
+                  Navigator.pop(context);
+                  final result = await FilePicker.platform.pickFiles(allowMultiple: true);
+                  if (result != null) {
+                    setState(() {
+                      _selectedFiles.addAll(result.paths.whereType<String>().map(File.new));
+                    });
+                  }
+                },
+              ),
+            ],
+          ),
+        ),
+      );
+    } else {
+      final result = await FilePicker.platform.pickFiles(allowMultiple: true);
+      if (result != null) {
+        setState(() {
+          _selectedFiles = result.paths
+              .whereType<String>()
+              .map(File.new)
+              .toList();
+        });
+      }
     }
   }
 
@@ -88,33 +296,95 @@ class _HomeScreenState extends State<HomeScreen>
       await _webRTCService.connectToPeer(_selectedDevice!.ip);
       setState(() {
         _isConnecting = false;
-        _isTransferring = true;
-        _statusMessage = 'Envoi en cours...';
+        _statusMessage = 'En attente d\'acceptation...';
       });
 
+      final filesInfo = await Future.wait(
+        _selectedFiles.map((file) async {
+          final size = await file.length();
+          return FileInfo(
+            name: file.path.split(Platform.pathSeparator).last,
+            size: size,
+            type: file.path.split('.').last,
+          );
+        }),
+      );
+
+      final request = TransferRequest(
+        id: DateTime.now().millisecondsSinceEpoch.toString(),
+        senderId: 'local',
+        senderName: widget.localDeviceName,
+        files: filesInfo,
+        timestamp: DateTime.now(),
+      );
+
+      _webRTCService.sendTransferRequest(request);
+    } catch (e) {
+      setState(() {
+        _isConnecting = false;
+        _statusMessage = 'Erreur de connexion';
+      });
+      _showSnack('❌ Erreur: $e');
+    }
+  }
+
+  Future<void> _startFileTransfer() async {
+    setState(() {
+      _isTransferring = true;
+      _isCancelled = false;
+      _isPaused = false;
+      _statusMessage = 'Envoi en cours...';
+    });
+
+    try {
       for (final file in _selectedFiles) {
+        if (_isCancelled) break;
         final size = await file.length();
         int sent = 0;
-        final stream = file.openRead();
-        await for (final chunk in stream) {
-          _webRTCService.sendData(Uint8List.fromList(chunk));
+        final raf = await file.open(mode: FileMode.read);
+        const chunkSize = 16 * 1024; // 16KB to prevent WebRTC crashes
+        while (sent < size) {
+          if (_isCancelled) break;
+          if (_isPaused) {
+            await Future.delayed(const Duration(milliseconds: 200));
+            continue;
+          }
+          final chunk = await raf.read(chunkSize);
+          if (chunk.isEmpty) break;
+          _webRTCService.sendData(chunk);
           sent += chunk.length;
           setState(() {
             _progress = sent / size;
             _statusMessage =
                 'Envoi : ${file.path.split(Platform.pathSeparator).last}';
           });
-          await Future.delayed(const Duration(milliseconds: 5));
+          await Future.delayed(const Duration(milliseconds: 1));
         }
+        await raf.close();
       }
+
+      if (_isCancelled) return;
 
       setState(() {
         _isTransferring = false;
         _progress = 1.0;
         _statusMessage = '✅ Envoi terminé !';
         _selectedFiles = [];
+        _currentTransferId = null;
       });
       _showSnack('✅ Fichiers envoyés avec succès !');
+
+      final historyItem = HistoryItem(
+        id: const Uuid().v4(),
+        type: 'send',
+        peerName: _selectedDevice?.name ?? 'Inconnu',
+        fileName: 'Plusieurs fichiers', // simplifcation for now
+        filePath: '',
+        size: 0,
+        timestamp: DateTime.now().millisecondsSinceEpoch,
+        status: 'completed',
+      );
+      HistoryDB.instance.insertItem(historyItem);
     } catch (e) {
       setState(() {
         _isConnecting = false;
@@ -126,9 +396,48 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   void _showSnack(String msg) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(msg), behavior: SnackBarBehavior.floating),
+    OverlayEntry? entry;
+    entry = OverlayEntry(
+      builder: (context) => Positioned(
+        top: 60,
+        left: 24,
+        right: 24,
+        child: Material(
+          color: Colors.transparent,
+          child: Align(
+            alignment: Alignment.topCenter,
+            child: GestureDetector(
+              onTap: () {
+                entry?.remove();
+                entry = null;
+              },
+              child: Container(
+                constraints: const BoxConstraints(maxWidth: 400),
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                decoration: BoxDecoration(
+                  color: Colors.grey.shade800,
+                  borderRadius: BorderRadius.circular(8),
+                  boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 4, offset: Offset(0, 2))],
+                ),
+                child: Text(
+                  msg,
+                  style: const TextStyle(color: Colors.white, fontSize: 14),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
     );
+    Overlay.of(context).insert(entry!);
+    Future.delayed(const Duration(seconds: 4), () {
+      if (entry != null && entry!.mounted) {
+        entry!.remove();
+        entry = null;
+      }
+    });
   }
 
   @override
@@ -172,6 +481,49 @@ class _HomeScreenState extends State<HomeScreen>
               ),
             ),
           ),
+          IconButton(
+            icon: const Icon(Icons.history),
+            tooltip: 'Historique',
+            onPressed: () => Navigator.push(
+              context,
+              PageRouteBuilder(
+                pageBuilder: (c, a, b) => const HistoryScreen(),
+                transitionsBuilder: (c, a, b, child) => FadeTransition(
+                  opacity: a,
+                  child: SlideTransition(
+                    position: Tween<Offset>(
+                      begin: const Offset(0, 0.05),
+                      end: Offset.zero,
+                    ).animate(CurvedAnimation(parent: a, curve: Curves.easeOutCubic)),
+                    child: child,
+                  ),
+                ),
+                transitionDuration: const Duration(milliseconds: 300),
+              ),
+            ),
+          ),
+          PopupMenuButton<String>(
+            icon: const Icon(Icons.more_vert),
+            onSelected: (value) {
+              if (value == 'invisible') {
+                setState(() {
+                  widget.discoveryService.toggleDiscoverability();
+                });
+              }
+            },
+            itemBuilder: (BuildContext context) => [
+              PopupMenuItem(
+                value: 'invisible',
+                child: Row(
+                  children: [
+                    Icon(widget.discoveryService.isDiscoverable ? Icons.visibility : Icons.visibility_off),
+                    const SizedBox(width: 8),
+                    Text(widget.discoveryService.isDiscoverable ? 'Rendre invisible' : 'Rendre visible'),
+                  ],
+                ),
+              ),
+            ],
+          ),
         ],
       ),
       body: SingleChildScrollView(
@@ -204,11 +556,22 @@ class _HomeScreenState extends State<HomeScreen>
             width: 280,
             decoration: BoxDecoration(
               color: colorScheme.surface,
+              borderRadius: const BorderRadius.only(
+                topRight: Radius.circular(20),
+                bottomRight: Radius.circular(20),
+              ),
               border: Border(
                 right: BorderSide(
                   color: colorScheme.outlineVariant.withAlpha(60),
                 ),
               ),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withAlpha(12),
+                  blurRadius: 16,
+                  offset: const Offset(4, 0),
+                ),
+              ],
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -268,6 +631,14 @@ class _HomeScreenState extends State<HomeScreen>
                       ),
                       const Spacer(),
                       IconButton(
+                        icon: Icon(
+                          widget.discoveryService.isDiscoverable ? Icons.visibility : Icons.visibility_off,
+                          size: 18,
+                        ),
+                        onPressed: () => setState(() => widget.discoveryService.toggleDiscoverability()),
+                        tooltip: 'Visibilité',
+                      ),
+                      IconButton(
                         icon: const Icon(Icons.refresh, size: 18),
                         onPressed: widget.onRefresh,
                         tooltip: 'Rafraîchir',
@@ -277,6 +648,44 @@ class _HomeScreenState extends State<HomeScreen>
                 ),
                 const SizedBox(height: 12),
                 Expanded(child: _buildDevicesSection(isMobile: false)),
+                // ─── Historique en bas du panel ───
+                const Divider(height: 1),
+                InkWell(
+                  borderRadius: const BorderRadius.only(
+                    bottomRight: Radius.circular(20),
+                  ),
+                  onTap: () => Navigator.push(
+                    context,
+                    PageRouteBuilder(
+                      pageBuilder: (c, a, b) => const HistoryScreen(),
+                      transitionsBuilder: (c, a, b, child) => FadeTransition(
+                        opacity: a,
+                        child: child,
+                      ),
+                      transitionDuration: const Duration(milliseconds: 250),
+                    ),
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+                    child: Row(
+                      children: [
+                        Icon(Icons.history_rounded, size: 20, color: colorScheme.onSurfaceVariant),
+                        const SizedBox(width: 12),
+                        Text(
+                          'Historique',
+                          style: GoogleFonts.plusJakartaSans(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                            color: colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                        const Spacer(),
+                        Icon(Icons.chevron_right_rounded, size: 18, color: colorScheme.onSurfaceVariant),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
               ],
             ),
           ),
@@ -489,22 +898,60 @@ class _HomeScreenState extends State<HomeScreen>
                 child: LinearProgressIndicator(
                   value: _progress,
                   minHeight: 8,
-                  backgroundColor: Theme.of(
-                    context,
-                  ).colorScheme.outlineVariant.withAlpha(40),
+                  backgroundColor: Theme.of(context).colorScheme.outlineVariant.withAlpha(40),
                   valueColor: AlwaysStoppedAnimation<Color>(
                     Theme.of(context).colorScheme.primary,
                   ),
                 ),
               ),
               const SizedBox(height: 8),
-              Text(
-                '${(_progress * 100).toStringAsFixed(0)}%  —  $_statusMessage',
-                style: TextStyle(
-                  fontSize: 12,
-                  color: Theme.of(context).colorScheme.onSurfaceVariant,
-                ),
-                textAlign: TextAlign.center,
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Expanded(
+                    child: Text(
+                      '${(_progress * 100).toStringAsFixed(0)}%  —  $_statusMessage',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      IconButton(
+                        icon: Icon(_isPaused ? Icons.play_arrow : Icons.pause, size: 20),
+                        onPressed: () {
+                          final action = _isPaused ? 'resume' : 'pause';
+                          if (_currentReceivingRequest != null) {
+                            _webRTCService.sendControlMessage(_currentReceivingRequest!.id, action);
+                          } else if (_currentTransferId != null) {
+                            _webRTCService.sendControlMessage(_currentTransferId!, action);
+                          }
+                          setState(() => _isPaused = !_isPaused);
+                        },
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.close, size: 20, color: Colors.red),
+                        onPressed: () {
+                          if (_currentReceivingRequest != null) {
+                            _webRTCService.sendControlMessage(_currentReceivingRequest!.id, 'cancel');
+                            _fileReceiver.cancelTransfer(_currentReceivingRequest!.id);
+                          } else if (_currentTransferId != null) {
+                            _webRTCService.sendControlMessage(_currentTransferId!, 'cancel');
+                          }
+                          setState(() {
+                            _isCancelled = true;
+                            _isTransferring = false;
+                            _statusMessage = 'Annulé';
+                          });
+                        },
+                      ),
+                    ],
+                  ),
+                ],
               ),
             ],
           ],
@@ -558,90 +1005,91 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   Widget _buildFilesList() {
-    return Column(
-      children: _selectedFiles.map((file) {
-        final name = file.path.split(Platform.pathSeparator).last;
-        final ext = name.contains('.')
-            ? name.split('.').last.toLowerCase()
-            : '';
-        final isImage = [
-          'jpg',
-          'jpeg',
-          'png',
-          'gif',
-          'webp',
-          'bmp',
-        ].contains(ext);
-        return Container(
-          margin: const EdgeInsets.only(bottom: 8),
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          decoration: BoxDecoration(
-            color: Theme.of(context).colorScheme.primary.withAlpha(8),
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(
-              color: Theme.of(context).colorScheme.primary.withAlpha(25),
+    return LayoutBuilder(builder: (context, constraints) {
+      final bool isDesktop = constraints.maxWidth > 400;
+      return Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        children: _selectedFiles.map((file) {
+          final name = file.path.split(Platform.pathSeparator).last;
+          final content = _buildFileItemContent(file, name);
+          return SizedBox(
+            width: isDesktop ? (constraints.maxWidth - 8) / 2 : double.infinity,
+            child: content,
+          );
+        }).toList(),
+      );
+    });
+  }
+
+  Widget _buildFileItemContent(File file, String name) {
+    final ext = name.contains('.') ? name.split('.').last.toLowerCase() : '';
+    final isImage = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].contains(ext);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.primary.withAlpha(8),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: Theme.of(context).colorScheme.primary.withAlpha(25),
+        ),
+      ),
+      child: Row(
+        children: [
+          // Vraie miniature pour les images, icône sinon
+          ClipRRect(
+            borderRadius: BorderRadius.circular(8),
+            child: isImage
+                ? Image.file(
+                    file,
+                    width: 48,
+                    height: 48,
+                    fit: BoxFit.cover,
+                    errorBuilder: (_, __, ___) => _fileIconBox(name),
+                  )
+                : _fileIconBox(name),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  name,
+                  style: GoogleFonts.plusJakartaSans(
+                    fontWeight: FontWeight.w600,
+                    fontSize: 13,
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
+                FutureBuilder<int>(
+                  future: file.length(),
+                  builder: (_, snap) {
+                    if (!snap.hasData) return const SizedBox();
+                    return Text(
+                      _formatSize(snap.data!),
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
+                    );
+                  },
+                ),
+              ],
             ),
           ),
-          child: Row(
-            children: [
-              // Vraie miniature pour les images, icône sinon
-              ClipRRect(
-                borderRadius: BorderRadius.circular(8),
-                child: isImage
-                    ? Image.file(
-                        file,
-                        width: 48,
-                        height: 48,
-                        fit: BoxFit.cover,
-                        errorBuilder: (_, __, ___) => _fileIconBox(name),
-                      )
-                    : _fileIconBox(name),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      name,
-                      style: GoogleFonts.plusJakartaSans(
-                        fontWeight: FontWeight.w600,
-                        fontSize: 13,
-                      ),
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    FutureBuilder<int>(
-                      future: file.length(),
-                      builder: (_, snap) {
-                        if (!snap.hasData) return const SizedBox();
-                        return Text(
-                          _formatSize(snap.data!),
-                          style: TextStyle(
-                            fontSize: 11,
-                            color: Theme.of(
-                              context,
-                            ).colorScheme.onSurfaceVariant,
-                          ),
-                        );
-                      },
-                    ),
-                  ],
-                ),
-              ),
-              IconButton(
-                icon: Icon(
-                  Icons.close_rounded,
-                  size: 16,
-                  color: Theme.of(context).colorScheme.onSurfaceVariant,
-                ),
-                onPressed: () => setState(() => _selectedFiles.remove(file)),
-                padding: EdgeInsets.zero,
-                constraints: const BoxConstraints(),
-              ),
-            ],
+          IconButton(
+            icon: Icon(
+              Icons.close_rounded,
+              size: 16,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+            onPressed: () => setState(() => _selectedFiles.remove(file)),
+            padding: EdgeInsets.zero,
+            constraints: const BoxConstraints(),
           ),
-        );
-      }).toList(),
+        ],
+      ),
     );
   }
 
@@ -670,63 +1118,205 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   Widget _buildDevicesSection({required bool isMobile}) {
-    if (widget.devices.isEmpty) {
-      return Padding(
-        padding: EdgeInsets.all(isMobile ? 0 : 20),
-        child: isMobile
-            ? Container(
-                padding: const EdgeInsets.all(20),
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(16),
-                  color: Theme.of(context).colorScheme.surface,
-                  border: Border.all(
-                    color: Theme.of(
-                      context,
-                    ).colorScheme.outlineVariant.withAlpha(60),
+    final colorScheme = Theme.of(context).colorScheme;
+    final filteredDevices = widget.devices
+        .where((d) =>
+            d.name.toLowerCase().contains(_deviceSearchQuery) ||
+            d.ip.contains(_deviceSearchQuery))
+        .toList();
+
+    return Column(
+      mainAxisSize: isMobile ? MainAxisSize.min : MainAxisSize.max,
+      children: [
+        // Barre de recherche
+        if (widget.devices.isNotEmpty) ...[
+          Padding(
+            padding: EdgeInsets.symmetric(
+              horizontal: isMobile ? 0 : 12,
+              vertical: 4,
+            ),
+            child: TextField(
+              controller: _deviceSearchController,
+              style: const TextStyle(fontSize: 13),
+              decoration: InputDecoration(
+                hintText: 'Rechercher un appareil...',
+                hintStyle: TextStyle(
+                  fontSize: 13,
+                  color: colorScheme.onSurfaceVariant.withAlpha(150),
+                ),
+                prefixIcon: const Icon(Icons.search, size: 18),
+                suffixIcon: _deviceSearchQuery.isNotEmpty
+                    ? IconButton(
+                        icon: const Icon(Icons.clear, size: 16),
+                        onPressed: () => _deviceSearchController.clear(),
+                      )
+                    : null,
+                filled: true,
+                fillColor: colorScheme.onSurface.withAlpha(6),
+                contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 8,
+                ),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: BorderSide(
+                    color: colorScheme.outlineVariant.withAlpha(60),
                   ),
                 ),
-                child: const Center(
-                  child: Column(
-                    children: [
-                      Icon(Icons.devices_other, size: 36, color: Colors.grey),
-                      SizedBox(height: 8),
-                      Text(
-                        'Aucun appareil détecté',
-                        style: TextStyle(fontWeight: FontWeight.w600),
-                      ),
-                      SizedBox(height: 4),
-                      Text(
-                        'Assure-toi que GoSend est ouvert sur l\'autre appareil sur le même Wi-Fi',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(fontSize: 12, color: Colors.grey),
-                      ),
-                    ],
+                enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: BorderSide(
+                    color: colorScheme.outlineVariant.withAlpha(60),
                   ),
                 ),
-              )
-            : Column(
-                children: const [
-                  Icon(Icons.devices_other, size: 36, color: Colors.grey),
-                  SizedBox(height: 8),
-                  Text(
-                    'Aucun appareil',
-                    style: TextStyle(fontWeight: FontWeight.w600),
+                focusedBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: BorderSide(
+                    color: colorScheme.primary.withAlpha(120),
                   ),
-                  SizedBox(height: 4),
-                  Padding(
-                    padding: EdgeInsets.symmetric(horizontal: 8),
-                    child: Text(
-                      'Ouvre GoSend sur un autre appareil sur le même Wi-Fi',
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 4),
+        ],
+        // Appareil local
+        _buildLocalDeviceCard(isMobile),
+        const SizedBox(height: 12),
+        // Liste des appareils découverts (filtrés)
+        if (isMobile)
+          filteredDevices.isEmpty
+              ? _buildEmptyDevicesState(isMobile)
+              : _buildDevicesList(isMobile, filteredDevices)
+        else
+          Expanded(
+            child: filteredDevices.isEmpty
+                ? _buildEmptyDevicesState(isMobile)
+                : _buildDevicesList(isMobile, filteredDevices),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildLocalDeviceCard(bool isMobile) {
+    final colorScheme = Theme.of(context).colorScheme;
+
+    return Container(
+      padding: EdgeInsets.symmetric(
+        horizontal: isMobile ? 12 : 16,
+        vertical: isMobile ? 8 : 12,
+      ),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(12),
+        color: colorScheme.surface,
+        border: Border.all(
+          color: colorScheme.outlineVariant.withAlpha(40),
+          width: 1,
+        ),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            Icons.computer,
+            color: colorScheme.onSurfaceVariant,
+            size: isMobile ? 16 : 18,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  widget.localDeviceName,
+                  style: GoogleFonts.plusJakartaSans(
+                    fontSize: isMobile ? 11 : 12,
+                    fontWeight: FontWeight.w600,
+                    color: colorScheme.onSurface,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                Text(
+                  widget.localIpAddress,
+                  style: GoogleFonts.plusJakartaSans(
+                    fontSize: isMobile ? 10 : 11,
+                    color: colorScheme.onSurfaceVariant,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ],
+            ),
+          ),
+          Icon(
+            Icons.check_circle,
+            color: colorScheme.primary,
+            size: isMobile ? 14 : 16,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildEmptyDevicesState(bool isMobile) {
+    final colorScheme = Theme.of(context).colorScheme;
+
+    return Padding(
+      padding: EdgeInsets.all(isMobile ? 0 : 20),
+      child: isMobile
+          ? Container(
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(16),
+                color: colorScheme.surface,
+                border: Border.all(
+                  color: colorScheme.outlineVariant.withAlpha(60),
+                ),
+              ),
+              child: const Center(
+                child: Column(
+                  children: [
+                    Icon(Icons.devices_other, size: 36, color: Colors.grey),
+                    SizedBox(height: 8),
+                    Text(
+                      'Aucun appareil détecté',
+                      style: TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                    SizedBox(height: 4),
+                    Text(
+                      'Assure-toi que GoSend est ouvert sur l\'autre appareil sur le même Wi-Fi',
                       textAlign: TextAlign.center,
                       style: TextStyle(fontSize: 12, color: Colors.grey),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
-      );
-    }
+            )
+          : Column(
+              children: const [
+                Icon(Icons.devices_other, size: 36, color: Colors.grey),
+                SizedBox(height: 8),
+                Text(
+                  'Aucun appareil',
+                  style: TextStyle(fontWeight: FontWeight.w600),
+                ),
+                SizedBox(height: 4),
+                Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 8),
+                  child: Text(
+                    'Ouvre GoSend sur un autre appareil sur le même Wi-Fi',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 12, color: Colors.grey),
+                  ),
+                ),
+              ],
+            ),
+    );
+  }
 
-    final deviceWidgets = widget.devices.map((device) {
+  Widget _buildDevicesList(bool isMobile, List<dynamic> devices) {
+    final deviceWidgets = devices.map((device) {
       final isSelected = _selectedDevice?.id == device.id;
       return GestureDetector(
         onTap: () =>
