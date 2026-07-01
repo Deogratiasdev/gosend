@@ -98,11 +98,35 @@ class _HomeScreenState extends State<HomeScreen>
           'getSharedFiles',
         );
         if (sharedFiles != null && sharedFiles.isNotEmpty) {
-          setState(() {
-            _selectedFiles = sharedFiles.map((uri) {
-              return File(uri.toString());
-            }).toList();
-          });
+          final List<File> files = [];
+
+          for (final uri in sharedFiles) {
+            try {
+              final uriString = uri.toString();
+              // Pour les URIs content://, on utilise file_picker pour les lire
+              if (uriString.startsWith('content://')) {
+                // Pour les URIs content://, on doit utiliser une méthode native
+                // Pour l'instant, on saute les URIs content://
+                debugPrint('URI content:// détecté (non supporté): $uriString');
+                continue;
+              } else {
+                // Pour les URIs file://, on peut créer directement un File
+                final cleanPath = uriString.replaceFirst('file://', '');
+                final file = File(cleanPath);
+                if (await file.exists()) {
+                  files.add(file);
+                }
+              }
+            } catch (e) {
+              debugPrint('Erreur traitement URI $uri: $e');
+            }
+          }
+
+          if (files.isNotEmpty) {
+            setState(() {
+              _selectedFiles = files;
+            });
+          }
         }
       } catch (e) {
         debugPrint('Erreur récupération fichiers partagés: $e');
@@ -161,10 +185,21 @@ class _HomeScreenState extends State<HomeScreen>
         _currentReceivingRequest!.id,
         data,
       );
+
+      // Calculer la progression globale sur tous les fichiers
+      final currentFileIndex = _fileReceiver.getCurrentFileIndex();
+      final totalFiles = _fileReceiver.getTotalFiles();
+      final globalProgress = (currentFileIndex + progress) / totalFiles;
+
+      final currentFileName =
+          _fileReceiver.getCurrentFileName() ??
+          _currentReceivingRequest!.files.first.name;
+
       setState(() {
-        _progress = progress;
-        _statusMessage =
-            'Réception : ${_currentReceivingRequest!.files.first.name}';
+        _progress = globalProgress;
+        _statusMessage = totalFiles > 1
+            ? 'Réception ($currentFileIndex/$totalFiles) : $currentFileName'
+            : 'Réception : $currentFileName';
       });
 
       if (progress >= 1.0) {
