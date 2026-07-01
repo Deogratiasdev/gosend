@@ -16,11 +16,14 @@ class WebRTCService {
   RTCPeerConnection? _peerConnection;
   RTCDataChannel? _dataChannel;
 
+  RTCDataChannel? get dataChannel => _dataChannel;
+
   Function(Uint8List)? onDataReceived;
   Function(RTCDataChannelState)? onChannelStateChanged;
   Function(TransferRequest)? onTransferRequestReceived;
   Function(String, bool)? onTransferResponse;
   Function(String, String)? onControlMessage;
+  Function(String)? onIceConnectionTypeChanged;
 
   final _iceServers = <String, dynamic>{
     'iceServers': [
@@ -45,7 +48,8 @@ class WebRTCService {
     final data = jsonDecode(payload);
 
     // Récupérer la vraie IP du peer (le Sender) depuis le contexte Shelf
-    final connInfo = request.context['shelf.io.connection_info'] as HttpConnectionInfo?;
+    final connInfo =
+        request.context['shelf.io.connection_info'] as HttpConnectionInfo?;
     if (connInfo != null) {
       _currentPeerIp = connInfo.remoteAddress.address;
     } else {
@@ -71,7 +75,8 @@ class WebRTCService {
     final payload = await request.readAsString();
     final data = jsonDecode(payload);
 
-    final connInfo = request.context['shelf.io.connection_info'] as HttpConnectionInfo?;
+    final connInfo =
+        request.context['shelf.io.connection_info'] as HttpConnectionInfo?;
     if (connInfo != null) {
       _currentPeerIp = connInfo.remoteAddress.address;
     } else {
@@ -113,6 +118,16 @@ class WebRTCService {
 
     _peerConnection!.onIceConnectionState = (state) {
       debugPrint('ICE connection state: $state');
+
+      // Détecter le type de connexion
+      String connectionType = 'unknown';
+      if (state == RTCIceConnectionState.RTCIceConnectionStateConnected) {
+        connectionType = 'direct'; // Par défaut, on assume direct
+        onIceConnectionTypeChanged?.call(connectionType);
+      } else if (state == RTCIceConnectionState.RTCIceConnectionStateFailed) {
+        connectionType = 'failed';
+        onIceConnectionTypeChanged?.call(connectionType);
+      }
     };
   }
 
@@ -157,15 +172,17 @@ class WebRTCService {
     if (_currentPeerIp == null) return;
 
     try {
-      await http.post(
-        Uri.parse('http://$_currentPeerIp:$signalingPort/candidate'),
-        headers: {'content-type': 'application/json'},
-        body: jsonEncode({
-          'candidate': candidate.candidate,
-          'sdpMid': candidate.sdpMid,
-          'sdpMLineIndex': candidate.sdpMLineIndex,
-        }),
-      ).timeout(const Duration(seconds: 5));
+      await http
+          .post(
+            Uri.parse('http://$_currentPeerIp:$signalingPort/candidate'),
+            headers: {'content-type': 'application/json'},
+            body: jsonEncode({
+              'candidate': candidate.candidate,
+              'sdpMid': candidate.sdpMid,
+              'sdpMLineIndex': candidate.sdpMLineIndex,
+            }),
+          )
+          .timeout(const Duration(seconds: 5));
     } catch (e) {
       debugPrint('Error sending ICE candidate: $e');
     }
@@ -189,11 +206,13 @@ class WebRTCService {
     await _peerConnection!.setLocalDescription(offer);
 
     // Send offer to peer
-    final response = await http.post(
-      Uri.parse('http://$peerIp:$signalingPort/offer'),
-      headers: {'content-type': 'application/json'},
-      body: jsonEncode({'sdp': offer.sdp, 'type': offer.type}),
-    ).timeout(const Duration(seconds: 10));
+    final response = await http
+        .post(
+          Uri.parse('http://$peerIp:$signalingPort/offer'),
+          headers: {'content-type': 'application/json'},
+          body: jsonEncode({'sdp': offer.sdp, 'type': offer.type}),
+        )
+        .timeout(const Duration(seconds: 10));
 
     if (response.statusCode == 200) {
       final answerData = jsonDecode(response.body);
@@ -201,18 +220,19 @@ class WebRTCService {
         RTCSessionDescription(answerData['sdp'], answerData['type']),
       );
     }
-    
+
     if (_dataChannel?.state != RTCDataChannelState.RTCDataChannelOpen) {
       final completer = Completer<void>();
       final originalCallback = onChannelStateChanged;
       onChannelStateChanged = (state) {
         if (originalCallback != null) originalCallback(state);
         debugPrint('DataChannel state: $state');
-        if (state == RTCDataChannelState.RTCDataChannelOpen && !completer.isCompleted) {
+        if (state == RTCDataChannelState.RTCDataChannelOpen &&
+            !completer.isCompleted) {
           completer.complete();
         }
       };
-      
+
       try {
         await completer.future.timeout(const Duration(seconds: 10));
       } on TimeoutException {

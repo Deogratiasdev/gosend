@@ -1,5 +1,7 @@
 import 'dart:io';
 import 'dart:typed_data';
+import 'package:flutter/services.dart';
+import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
@@ -12,6 +14,7 @@ import '../../core/network/discovery_service.dart';
 import '../../core/network/webrtc_service.dart';
 import '../../core/notifications/notification_service.dart';
 import '../../core/transfer/file_receiver.dart';
+import '../../core/transfer/optimized_transfer_manager.dart';
 import '../../models/device.dart';
 import '../../models/history_item.dart';
 import '../../models/transfer_request.dart';
@@ -57,6 +60,8 @@ class _HomeScreenState extends State<HomeScreen>
   bool _isCancelled = false;
   final TextEditingController _deviceSearchController = TextEditingController();
   String _deviceSearchQuery = '';
+  static const platform = MethodChannel('com.example.gosend/share');
+  String _iceConnectionType = 'En attente...';
 
   @override
   void initState() {
@@ -73,9 +78,36 @@ class _HomeScreenState extends State<HomeScreen>
     _webRTCService.onTransferResponse = _handleTransferResponse;
     _webRTCService.onDataReceived = _handleDataReceived;
     _webRTCService.onControlMessage = _handleControlMessage;
+    _webRTCService.onIceConnectionTypeChanged = (type) {
+      setState(() {
+        _iceConnectionType = type;
+      });
+    };
     _deviceSearchController.addListener(() {
-      setState(() => _deviceSearchQuery = _deviceSearchController.text.toLowerCase());
+      setState(
+        () => _deviceSearchQuery = _deviceSearchController.text.toLowerCase(),
+      );
     });
+    _checkSharedFiles();
+  }
+
+  Future<void> _checkSharedFiles() async {
+    if (Platform.isAndroid) {
+      try {
+        final List<dynamic>? sharedFiles = await platform.invokeMethod(
+          'getSharedFiles',
+        );
+        if (sharedFiles != null && sharedFiles.isNotEmpty) {
+          setState(() {
+            _selectedFiles = sharedFiles.map((uri) {
+              return File(uri.toString());
+            }).toList();
+          });
+        }
+      } catch (e) {
+        debugPrint('Erreur récupération fichiers partagés: $e');
+      }
+    }
   }
 
   @override
@@ -151,12 +183,12 @@ class _HomeScreenState extends State<HomeScreen>
         _progress = 0.0;
       });
       _showSnack('✅ Fichier enregistré avec succès !');
-      
+
       NotificationService().showNotification(
         title: 'Transfert terminé',
         body: 'Fichier ${_currentReceivingRequest!.files.first.name} reçu',
       );
-      
+
       final historyItem = HistoryItem(
         id: const Uuid().v4(),
         type: 'receive',
@@ -168,7 +200,7 @@ class _HomeScreenState extends State<HomeScreen>
         status: 'completed',
       );
       HistoryDB.instance.insertItem(historyItem);
-      
+
       _currentReceivingRequest = null;
     }
   }
@@ -226,7 +258,8 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   Future<void> _pickFiles() async {
-    if (MediaQuery.of(context).size.width <= 800 && Platform.isAndroid || Platform.isIOS) {
+    if (MediaQuery.of(context).size.width <= 800 && Platform.isAndroid ||
+        Platform.isIOS) {
       showModalBottomSheet(
         context: context,
         builder: (context) => SafeArea(
@@ -242,7 +275,9 @@ class _HomeScreenState extends State<HomeScreen>
                   final pickedFiles = await picker.pickMultipleMedia();
                   if (pickedFiles.isNotEmpty) {
                     setState(() {
-                      _selectedFiles.addAll(pickedFiles.map((x) => File(x.path)));
+                      _selectedFiles.addAll(
+                        pickedFiles.map((x) => File(x.path)),
+                      );
                     });
                   }
                 },
@@ -252,10 +287,14 @@ class _HomeScreenState extends State<HomeScreen>
                 title: const Text('Fichiers'),
                 onTap: () async {
                   Navigator.pop(context);
-                  final result = await FilePicker.platform.pickFiles(allowMultiple: true);
+                  final result = await FilePicker.platform.pickFiles(
+                    allowMultiple: true,
+                  );
                   if (result != null) {
                     setState(() {
-                      _selectedFiles.addAll(result.paths.whereType<String>().map(File.new));
+                      _selectedFiles.addAll(
+                        result.paths.whereType<String>().map(File.new),
+                      );
                     });
                   }
                 },
@@ -337,30 +376,67 @@ class _HomeScreenState extends State<HomeScreen>
     });
 
     try {
+      // Attendre que le DataChannel soit ouvert
+      if (_webRTCService.dataChannel?.state !=
+          RTCDataChannelState.RTCDataChannelOpen) {
+        setState(() {
+          _statusMessage = 'Attente connexion DataChannel...';
+        });
+        await Future.delayed(const Duration(seconds: 2));
+      }
+
+      final dataChannel = _webRTCService.dataChannel;
+      if (dataChannel == null ||
+          dataChannel.state != RTCDataChannelState.RTCDataChannelOpen) {
+        throw Exception('DataChannel non disponible');
+      }
+
       for (final file in _selectedFiles) {
         if (_isCancelled) break;
+
         final size = await file.length();
-        int sent = 0;
-        final raf = await file.open(mode: FileMode.read);
-        const chunkSize = 16 * 1024; // 16KB to prevent WebRTC crashes
-        while (sent < size) {
-          if (_isCancelled) break;
-          if (_isPaused) {
-            await Future.delayed(const Duration(milliseconds: 200));
-            continue;
-          }
-          final chunk = await raf.read(chunkSize);
-          if (chunk.isEmpty) break;
-          _webRTCService.sendData(chunk);
-          sent += chunk.length;
-          setState(() {
-            _progress = sent / size;
-            _statusMessage =
-                'Envoi : ${file.path.split(Platform.pathSeparator).last}';
-          });
-          await Future.delayed(const Duration(milliseconds: 1));
+        final fileName = file.path.split(Platform.pathSeparator).last;
+
+        final transferManager = OptimizedTransferManager(
+          dataChannel: dataChannel,
+          onProgress: (sent) {
+            setState(() {
+              _progress = sent / size;
+              _statusMessage = 'Envoi : $fileName';
+            });
+          },
+          onComplete: () {
+            // Enregistrer dans l'historique
+            final historyItem = HistoryItem(
+              id: const Uuid().v4(),
+              type: 'send',
+              peerName: _selectedDevice?.name ?? 'Inconnu',
+              fileName: fileName,
+              filePath: file.path,
+              size: size,
+              timestamp: DateTime.now().millisecondsSinceEpoch,
+              status: 'completed',
+            );
+            HistoryDB.instance.insertItem(historyItem);
+          },
+          onSpeedUpdate: (speedMBps) {
+            setState(() {
+              _statusMessage =
+                  'Envoi : $fileName (${speedMBps.toStringAsFixed(1)} MB/s)';
+            });
+          },
+          onStatusUpdate: (status) {
+            debugPrint('Transfer status: $status');
+          },
+        );
+
+        if (_isPaused) {
+          transferManager.pause();
         }
-        await raf.close();
+
+        await transferManager.sendFile(file);
+
+        if (_isCancelled) break;
       }
 
       if (_isCancelled) return;
@@ -373,18 +449,6 @@ class _HomeScreenState extends State<HomeScreen>
         _currentTransferId = null;
       });
       _showSnack('✅ Fichiers envoyés avec succès !');
-
-      final historyItem = HistoryItem(
-        id: const Uuid().v4(),
-        type: 'send',
-        peerName: _selectedDevice?.name ?? 'Inconnu',
-        fileName: 'Plusieurs fichiers', // simplifcation for now
-        filePath: '',
-        size: 0,
-        timestamp: DateTime.now().millisecondsSinceEpoch,
-        status: 'completed',
-      );
-      HistoryDB.instance.insertItem(historyItem);
     } catch (e) {
       setState(() {
         _isConnecting = false;
@@ -413,11 +477,20 @@ class _HomeScreenState extends State<HomeScreen>
               },
               child: Container(
                 constraints: const BoxConstraints(maxWidth: 400),
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 12,
+                ),
                 decoration: BoxDecoration(
                   color: Colors.grey.shade800,
                   borderRadius: BorderRadius.circular(8),
-                  boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 4, offset: Offset(0, 2))],
+                  boxShadow: const [
+                    BoxShadow(
+                      color: Colors.black26,
+                      blurRadius: 4,
+                      offset: Offset(0, 2),
+                    ),
+                  ],
                 ),
                 child: Text(
                   msg,
@@ -491,10 +564,16 @@ class _HomeScreenState extends State<HomeScreen>
                 transitionsBuilder: (c, a, b, child) => FadeTransition(
                   opacity: a,
                   child: SlideTransition(
-                    position: Tween<Offset>(
-                      begin: const Offset(0, 0.05),
-                      end: Offset.zero,
-                    ).animate(CurvedAnimation(parent: a, curve: Curves.easeOutCubic)),
+                    position:
+                        Tween<Offset>(
+                          begin: const Offset(0, 0.05),
+                          end: Offset.zero,
+                        ).animate(
+                          CurvedAnimation(
+                            parent: a,
+                            curve: Curves.easeOutCubic,
+                          ),
+                        ),
                     child: child,
                   ),
                 ),
@@ -516,9 +595,17 @@ class _HomeScreenState extends State<HomeScreen>
                 value: 'invisible',
                 child: Row(
                   children: [
-                    Icon(widget.discoveryService.isDiscoverable ? Icons.visibility : Icons.visibility_off),
+                    Icon(
+                      widget.discoveryService.isDiscoverable
+                          ? Icons.visibility
+                          : Icons.visibility_off,
+                    ),
                     const SizedBox(width: 8),
-                    Text(widget.discoveryService.isDiscoverable ? 'Rendre invisible' : 'Rendre visible'),
+                    Text(
+                      widget.discoveryService.isDiscoverable
+                          ? 'Rendre invisible'
+                          : 'Rendre visible',
+                    ),
                   ],
                 ),
               ),
@@ -632,10 +719,14 @@ class _HomeScreenState extends State<HomeScreen>
                       const Spacer(),
                       IconButton(
                         icon: Icon(
-                          widget.discoveryService.isDiscoverable ? Icons.visibility : Icons.visibility_off,
+                          widget.discoveryService.isDiscoverable
+                              ? Icons.visibility
+                              : Icons.visibility_off,
                           size: 18,
                         ),
-                        onPressed: () => setState(() => widget.discoveryService.toggleDiscoverability()),
+                        onPressed: () => setState(
+                          () => widget.discoveryService.toggleDiscoverability(),
+                        ),
                         tooltip: 'Visibilité',
                       ),
                       IconButton(
@@ -658,18 +749,23 @@ class _HomeScreenState extends State<HomeScreen>
                     context,
                     PageRouteBuilder(
                       pageBuilder: (c, a, b) => const HistoryScreen(),
-                      transitionsBuilder: (c, a, b, child) => FadeTransition(
-                        opacity: a,
-                        child: child,
-                      ),
+                      transitionsBuilder: (c, a, b, child) =>
+                          FadeTransition(opacity: a, child: child),
                       transitionDuration: const Duration(milliseconds: 250),
                     ),
                   ),
                   child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 20,
+                      vertical: 16,
+                    ),
                     child: Row(
                       children: [
-                        Icon(Icons.history_rounded, size: 20, color: colorScheme.onSurfaceVariant),
+                        Icon(
+                          Icons.history_rounded,
+                          size: 20,
+                          color: colorScheme.onSurfaceVariant,
+                        ),
                         const SizedBox(width: 12),
                         Text(
                           'Historique',
@@ -680,7 +776,11 @@ class _HomeScreenState extends State<HomeScreen>
                           ),
                         ),
                         const Spacer(),
-                        Icon(Icons.chevron_right_rounded, size: 18, color: colorScheme.onSurfaceVariant),
+                        Icon(
+                          Icons.chevron_right_rounded,
+                          size: 18,
+                          color: colorScheme.onSurfaceVariant,
+                        ),
                       ],
                     ),
                   ),
@@ -812,6 +912,42 @@ class _HomeScreenState extends State<HomeScreen>
             _statusMessage,
             style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
           ),
+          if (_iceConnectionType.isNotEmpty &&
+              _iceConnectionType != 'En attente...') ...[
+            const SizedBox(width: 8),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              decoration: BoxDecoration(
+                color: _iceConnectionType == 'direct'
+                    ? Colors.green.withAlpha(30)
+                    : Colors.orange.withAlpha(30),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    _iceConnectionType == 'direct' ? Icons.wifi : Icons.cloud,
+                    size: 10,
+                    color: _iceConnectionType == 'direct'
+                        ? Colors.green
+                        : Colors.orange,
+                  ),
+                  const SizedBox(width: 4),
+                  Text(
+                    _iceConnectionType == 'direct' ? 'LAN' : 'NAT',
+                    style: TextStyle(
+                      fontSize: 10,
+                      fontWeight: FontWeight.w600,
+                      color: _iceConnectionType == 'direct'
+                          ? Colors.green
+                          : Colors.orange,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
         ],
       ),
     );
@@ -898,7 +1034,9 @@ class _HomeScreenState extends State<HomeScreen>
                 child: LinearProgressIndicator(
                   value: _progress,
                   minHeight: 8,
-                  backgroundColor: Theme.of(context).colorScheme.outlineVariant.withAlpha(40),
+                  backgroundColor: Theme.of(
+                    context,
+                  ).colorScheme.outlineVariant.withAlpha(40),
                   valueColor: AlwaysStoppedAnimation<Color>(
                     Theme.of(context).colorScheme.primary,
                   ),
@@ -922,25 +1060,46 @@ class _HomeScreenState extends State<HomeScreen>
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       IconButton(
-                        icon: Icon(_isPaused ? Icons.play_arrow : Icons.pause, size: 20),
+                        icon: Icon(
+                          _isPaused ? Icons.play_arrow : Icons.pause,
+                          size: 20,
+                        ),
                         onPressed: () {
                           final action = _isPaused ? 'resume' : 'pause';
                           if (_currentReceivingRequest != null) {
-                            _webRTCService.sendControlMessage(_currentReceivingRequest!.id, action);
+                            _webRTCService.sendControlMessage(
+                              _currentReceivingRequest!.id,
+                              action,
+                            );
                           } else if (_currentTransferId != null) {
-                            _webRTCService.sendControlMessage(_currentTransferId!, action);
+                            _webRTCService.sendControlMessage(
+                              _currentTransferId!,
+                              action,
+                            );
                           }
                           setState(() => _isPaused = !_isPaused);
                         },
                       ),
                       IconButton(
-                        icon: const Icon(Icons.close, size: 20, color: Colors.red),
+                        icon: const Icon(
+                          Icons.close,
+                          size: 20,
+                          color: Colors.red,
+                        ),
                         onPressed: () {
                           if (_currentReceivingRequest != null) {
-                            _webRTCService.sendControlMessage(_currentReceivingRequest!.id, 'cancel');
-                            _fileReceiver.cancelTransfer(_currentReceivingRequest!.id);
+                            _webRTCService.sendControlMessage(
+                              _currentReceivingRequest!.id,
+                              'cancel',
+                            );
+                            _fileReceiver.cancelTransfer(
+                              _currentReceivingRequest!.id,
+                            );
                           } else if (_currentTransferId != null) {
-                            _webRTCService.sendControlMessage(_currentTransferId!, 'cancel');
+                            _webRTCService.sendControlMessage(
+                              _currentTransferId!,
+                              'cancel',
+                            );
                           }
                           setState(() {
                             _isCancelled = true;
@@ -1005,21 +1164,25 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   Widget _buildFilesList() {
-    return LayoutBuilder(builder: (context, constraints) {
-      final bool isDesktop = constraints.maxWidth > 400;
-      return Wrap(
-        spacing: 8,
-        runSpacing: 8,
-        children: _selectedFiles.map((file) {
-          final name = file.path.split(Platform.pathSeparator).last;
-          final content = _buildFileItemContent(file, name);
-          return SizedBox(
-            width: isDesktop ? (constraints.maxWidth - 8) / 2 : double.infinity,
-            child: content,
-          );
-        }).toList(),
-      );
-    });
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final bool isDesktop = constraints.maxWidth > 400;
+        return Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: _selectedFiles.map((file) {
+            final name = file.path.split(Platform.pathSeparator).last;
+            final content = _buildFileItemContent(file, name);
+            return SizedBox(
+              width: isDesktop
+                  ? (constraints.maxWidth - 8) / 2
+                  : double.infinity,
+              child: content,
+            );
+          }).toList(),
+        );
+      },
+    );
   }
 
   Widget _buildFileItemContent(File file, String name) {
@@ -1120,59 +1283,51 @@ class _HomeScreenState extends State<HomeScreen>
   Widget _buildDevicesSection({required bool isMobile}) {
     final colorScheme = Theme.of(context).colorScheme;
     final filteredDevices = widget.devices
-        .where((d) =>
-            d.name.toLowerCase().contains(_deviceSearchQuery) ||
-            d.ip.contains(_deviceSearchQuery))
+        .where(
+          (d) =>
+              d.name.toLowerCase().contains(_deviceSearchQuery) ||
+              d.ip.contains(_deviceSearchQuery),
+        )
         .toList();
 
     return Column(
       mainAxisSize: isMobile ? MainAxisSize.min : MainAxisSize.max,
       children: [
-        // Barre de recherche
-        if (widget.devices.isNotEmpty) ...[
+        // Barre de recherche (compacte sur PC)
+        if (!isMobile && widget.devices.isNotEmpty) ...[
           Padding(
-            padding: EdgeInsets.symmetric(
-              horizontal: isMobile ? 0 : 12,
-              vertical: 4,
-            ),
-            child: TextField(
-              controller: _deviceSearchController,
-              style: const TextStyle(fontSize: 13),
-              decoration: InputDecoration(
-                hintText: 'Rechercher un appareil...',
-                hintStyle: TextStyle(
-                  fontSize: 13,
-                  color: colorScheme.onSurfaceVariant.withAlpha(150),
-                ),
-                prefixIcon: const Icon(Icons.search, size: 18),
-                suffixIcon: _deviceSearchQuery.isNotEmpty
-                    ? IconButton(
-                        icon: const Icon(Icons.clear, size: 16),
-                        onPressed: () => _deviceSearchController.clear(),
-                      )
-                    : null,
-                filled: true,
-                fillColor: colorScheme.onSurface.withAlpha(6),
-                contentPadding: const EdgeInsets.symmetric(
-                  horizontal: 12,
-                  vertical: 8,
-                ),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(10),
-                  borderSide: BorderSide(
-                    color: colorScheme.outlineVariant.withAlpha(60),
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+            child: SizedBox(
+              height: 36,
+              child: TextField(
+                controller: _deviceSearchController,
+                style: const TextStyle(fontSize: 12),
+                textAlign: TextAlign.center,
+                decoration: InputDecoration(
+                  hintText: 'Rechercher...',
+                  hintStyle: TextStyle(
+                    fontSize: 12,
+                    color: colorScheme.onSurfaceVariant.withAlpha(150),
                   ),
-                ),
-                enabledBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(10),
-                  borderSide: BorderSide(
-                    color: colorScheme.outlineVariant.withAlpha(60),
+                  filled: true,
+                  fillColor: colorScheme.onSurface.withAlpha(6),
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 6,
                   ),
-                ),
-                focusedBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(10),
-                  borderSide: BorderSide(
-                    color: colorScheme.primary.withAlpha(120),
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(18),
+                    borderSide: BorderSide.none,
+                  ),
+                  enabledBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(18),
+                    borderSide: BorderSide.none,
+                  ),
+                  focusedBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(18),
+                    borderSide: BorderSide(
+                      color: colorScheme.primary.withAlpha(120),
+                    ),
                   ),
                 ),
               ),

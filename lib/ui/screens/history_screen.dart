@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../../core/db/history_db.dart';
 import '../../models/history_item.dart';
 
@@ -35,9 +36,11 @@ class _HistoryScreenState extends State<HistoryScreen> {
       _filtered = List.from(_items);
     } else {
       _filtered = _items
-          .where((e) =>
-              e.fileName.toLowerCase().contains(_searchQuery) ||
-              e.peerName.toLowerCase().contains(_searchQuery))
+          .where(
+            (e) =>
+                e.fileName.toLowerCase().contains(_searchQuery) ||
+                e.peerName.toLowerCase().contains(_searchQuery),
+          )
           .toList();
     }
   }
@@ -67,6 +70,20 @@ class _HistoryScreenState extends State<HistoryScreen> {
     await HistoryDB.instance.clearHistory();
     _searchController.clear();
     _loadHistory();
+  }
+
+  Future<void> _openFile(String filePath) async {
+    try {
+      final file = File(filePath);
+      if (await file.exists()) {
+        final uri = Uri.file(filePath);
+        if (await canLaunchUrl(uri)) {
+          await launchUrl(uri);
+        }
+      }
+    } catch (e) {
+      debugPrint('Erreur ouverture fichier: $e');
+    }
   }
 
   @override
@@ -130,7 +147,9 @@ class _HistoryScreenState extends State<HistoryScreen> {
                       context: context,
                       builder: (context) => AlertDialog(
                         title: const Text('Effacer l\'historique'),
-                        content: const Text('Êtes-vous sûr de vouloir tout effacer ?'),
+                        content: const Text(
+                          'Êtes-vous sûr de vouloir tout effacer ?',
+                        ),
                         actions: [
                           TextButton(
                             onPressed: () => Navigator.pop(context),
@@ -141,7 +160,10 @@ class _HistoryScreenState extends State<HistoryScreen> {
                               Navigator.pop(context);
                               _clearAll();
                             },
-                            child: const Text('Effacer', style: TextStyle(color: Colors.red)),
+                            child: const Text(
+                              'Effacer',
+                              style: TextStyle(color: Colors.red),
+                            ),
                           ),
                         ],
                       ),
@@ -153,86 +175,230 @@ class _HistoryScreenState extends State<HistoryScreen> {
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
           : _filtered.isEmpty
-              ? Center(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Icon(
-                        _searchQuery.isNotEmpty ? Icons.search_off : Icons.history,
-                        size: 64,
-                        color: colorScheme.onSurfaceVariant.withAlpha(100),
-                      ),
-                      const SizedBox(height: 16),
-                      Text(
-                        _searchQuery.isNotEmpty
-                            ? 'Aucun résultat pour "$_searchQuery"'
-                            : 'Aucun historique',
-                        style: TextStyle(color: colorScheme.onSurfaceVariant),
-                      ),
-                    ],
+          ? Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(
+                    _searchQuery.isNotEmpty ? Icons.search_off : Icons.history,
+                    size: 64,
+                    color: colorScheme.onSurfaceVariant.withAlpha(100),
                   ),
-                )
-              : ListView.builder(
+                  const SizedBox(height: 16),
+                  Text(
+                    _searchQuery.isNotEmpty
+                        ? 'Aucun résultat pour "$_searchQuery"'
+                        : 'Aucun historique',
+                    style: TextStyle(color: colorScheme.onSurfaceVariant),
+                  ),
+                ],
+              ),
+            )
+          : LayoutBuilder(
+              builder: (context, constraints) {
+                final isDesktop = constraints.maxWidth > 800;
+
+                if (!isDesktop) {
+                  return ListView.builder(
+                    padding: const EdgeInsets.all(16),
+                    itemCount: _filtered.length,
+                    itemBuilder: (context, index) {
+                      final item = _filtered[index];
+                      final date = DateTime.fromMillisecondsSinceEpoch(
+                        item.timestamp,
+                      );
+                      final isReceive = item.type == 'receive';
+                      final ext = item.fileName.split('.').last.toLowerCase();
+                      final isImage = [
+                        'jpg',
+                        'jpeg',
+                        'png',
+                        'gif',
+                        'webp',
+                        'bmp',
+                      ].contains(ext);
+
+                      return Card(
+                        margin: const EdgeInsets.only(bottom: 12),
+                        child: ListTile(
+                          leading: Container(
+                            width: 48,
+                            height: 48,
+                            decoration: BoxDecoration(
+                              color: colorScheme.primary.withAlpha(15),
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(8),
+                              child: isImage && item.filePath.isNotEmpty
+                                  ? Image.file(
+                                      File(item.filePath),
+                                      fit: BoxFit.cover,
+                                      errorBuilder: (_, __, ___) => Icon(
+                                        Icons.image,
+                                        color: colorScheme.primary,
+                                      ),
+                                    )
+                                  : Icon(
+                                      isReceive ? Icons.download : Icons.upload,
+                                      color: colorScheme.primary,
+                                    ),
+                            ),
+                          ),
+                          title: Text(
+                            item.fileName,
+                            style: const TextStyle(
+                              fontWeight: FontWeight.w600,
+                              fontSize: 14,
+                            ),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          subtitle: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                '${isReceive ? 'Reçu de' : 'Envoyé à'} ${item.peerName}',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: colorScheme.onSurfaceVariant,
+                                ),
+                              ),
+                              Text(
+                                '${date.day}/${date.month}/${date.year} ${date.hour}:${date.minute.toString().padLeft(2, '0')}',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  color: colorScheme.onSurfaceVariant.withAlpha(
+                                    150,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          trailing: IconButton(
+                            icon: const Icon(Icons.delete_outline, size: 20),
+                            onPressed: () => _deleteItem(item.id),
+                          ),
+                        ),
+                      );
+                    },
+                  );
+                }
+
+                return GridView.builder(
                   padding: const EdgeInsets.all(16),
+                  gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: 2,
+                    crossAxisSpacing: 12,
+                    mainAxisSpacing: 12,
+                    childAspectRatio: 2.5,
+                  ),
                   itemCount: _filtered.length,
                   itemBuilder: (context, index) {
                     final item = _filtered[index];
-                    final date = DateTime.fromMillisecondsSinceEpoch(item.timestamp);
+                    final date = DateTime.fromMillisecondsSinceEpoch(
+                      item.timestamp,
+                    );
                     final isReceive = item.type == 'receive';
                     final ext = item.fileName.split('.').last.toLowerCase();
-                    final isImage = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].contains(ext);
+                    final isImage = [
+                      'jpg',
+                      'jpeg',
+                      'png',
+                      'gif',
+                      'webp',
+                      'bmp',
+                    ].contains(ext);
 
                     return Card(
-                      margin: const EdgeInsets.only(bottom: 12),
-                      child: ListTile(
-                        leading: Container(
-                          width: 48,
-                          height: 48,
-                          decoration: BoxDecoration(
-                            color: colorScheme.primary.withAlpha(15),
-                            borderRadius: BorderRadius.circular(8),
+                      child: InkWell(
+                        onTap: () {
+                          if (item.filePath.isNotEmpty) {
+                            _openFile(item.filePath);
+                          }
+                        },
+                        child: Padding(
+                          padding: const EdgeInsets.all(12),
+                          child: Row(
+                            children: [
+                              Container(
+                                width: 56,
+                                height: 56,
+                                decoration: BoxDecoration(
+                                  color: colorScheme.primary.withAlpha(15),
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
+                                child: ClipRRect(
+                                  borderRadius: BorderRadius.circular(10),
+                                  child: isImage && item.filePath.isNotEmpty
+                                      ? Image.file(
+                                          File(item.filePath),
+                                          fit: BoxFit.cover,
+                                          errorBuilder: (_, __, ___) => Icon(
+                                            Icons.image,
+                                            color: colorScheme.primary,
+                                          ),
+                                        )
+                                      : Icon(
+                                          isReceive
+                                              ? Icons.download
+                                              : Icons.upload,
+                                          color: colorScheme.primary,
+                                        ),
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    Text(
+                                      item.fileName,
+                                      style: const TextStyle(
+                                        fontWeight: FontWeight.w600,
+                                        fontSize: 13,
+                                      ),
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      '${isReceive ? 'Reçu de' : 'Envoyé à'} ${item.peerName}',
+                                      style: TextStyle(
+                                        fontSize: 11,
+                                        color: colorScheme.onSurfaceVariant,
+                                      ),
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                    Text(
+                                      '${date.day}/${date.month}/${date.year} ${date.hour}:${date.minute.toString().padLeft(2, '0')}',
+                                      style: TextStyle(
+                                        fontSize: 10,
+                                        color: colorScheme.onSurfaceVariant
+                                            .withAlpha(150),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              IconButton(
+                                icon: const Icon(
+                                  Icons.delete_outline,
+                                  size: 18,
+                                ),
+                                onPressed: () => _deleteItem(item.id),
+                              ),
+                            ],
                           ),
-                          child: ClipRRect(
-                            borderRadius: BorderRadius.circular(8),
-                            child: isImage && item.filePath.isNotEmpty
-                                ? Image.file(
-                                    File(item.filePath),
-                                    fit: BoxFit.cover,
-                                    errorBuilder: (_, __, ___) => Icon(Icons.image, color: colorScheme.primary),
-                                  )
-                                : Icon(
-                                    isReceive ? Icons.download : Icons.upload,
-                                    color: colorScheme.primary,
-                                  ),
-                          ),
-                        ),
-                        title: Text(
-                          item.fileName,
-                          style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                        subtitle: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              '${isReceive ? 'Reçu de' : 'Envoyé à'} ${item.peerName}',
-                              style: TextStyle(fontSize: 12, color: colorScheme.onSurfaceVariant),
-                            ),
-                            Text(
-                              '${date.day}/${date.month}/${date.year} ${date.hour}:${date.minute.toString().padLeft(2, '0')}',
-                              style: TextStyle(fontSize: 11, color: colorScheme.onSurfaceVariant.withAlpha(150)),
-                            ),
-                          ],
-                        ),
-                        trailing: IconButton(
-                          icon: const Icon(Icons.delete_outline, size: 20),
-                          onPressed: () => _deleteItem(item.id),
                         ),
                       ),
                     );
                   },
-                ),
+                );
+              },
+            ),
     );
   }
 }
