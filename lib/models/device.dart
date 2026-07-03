@@ -4,6 +4,7 @@ class Device {
   final String ip;
   final int port;
   final String os;
+  final int httpPort; // NOUVEAU : port du serveur HTTP de réception des fichiers
 
   Device({
     required this.id,
@@ -11,6 +12,7 @@ class Device {
     required this.ip,
     required this.port,
     required this.os,
+    this.httpPort = 8081, // valeur par défaut
   });
 
   Map<String, dynamic> toJson() {
@@ -20,6 +22,7 @@ class Device {
       'ip': ip,
       'port': port,
       'os': os,
+      'httpPort': httpPort,
     };
   }
 
@@ -30,6 +33,7 @@ class Device {
       ip: json['ip'] as String,
       port: json['port'] as int,
       os: json['os'] as String,
+      httpPort: json['httpPort'] ?? 8081,
     );
   }
 

@@ -60,6 +60,7 @@ class DiscoveryService {
         'name': localDeviceName,
         'os': localOs,
         'port': broadcastPort,
+        'httpPort': 8081, // NOUVEAU : port HTTP pour réception des fichiers
       });
 
       final buffer = utf8.encode(message);
@@ -84,6 +85,7 @@ class DiscoveryService {
         ip: datagram.address.address,
         port: data['port'] ?? broadcastPort,
         os: data['os'] ?? 'unknown',
+        httpPort: data['httpPort'] ?? 8081, // NOUVEAU
       );
 
       // Utiliser IP+nom comme clé unique pour éviter les doublons

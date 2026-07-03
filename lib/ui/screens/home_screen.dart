@@ -4,15 +4,12 @@ import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import '../../core/network/discovery_service.dart';
-import '../../core/network/webrtc_service.dart';
+import '../../core/network/http_transfer_service.dart';
 import '../../core/notifications/notification_service.dart';
-import '../../core/transfer/file_receiver.dart';
-import '../../core/transfer/optimized_transfer_manager.dart';
 import '../../models/device.dart';
 import '../../models/transfer_request.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -49,17 +46,15 @@ class _HomeScreenState extends State<HomeScreen>
   String _statusMessage = 'Prêt à envoyer';
   late AnimationController _pulseController;
   late Animation<double> _pulseAnimation;
-  late final WebRTCService _webRTCService;
-  late final FileReceiver _fileReceiver;
+  late final HttpTransferService _httpService;
   final List<TransferRequest> _incomingRequests = [];
   TransferRequest? _currentReceivingRequest;
   String? _currentTransferId;
   bool _isPaused = false;
-  bool _isCancelled = false;
+  bool _isCancelled = false; // Utilisé par le bouton d'annulation
   final TextEditingController _deviceSearchController = TextEditingController();
   String _deviceSearchQuery = '';
   static const platform = MethodChannel('com.example.gosend/share');
-  String _iceConnectionType = 'En attente...';
   String? _receiveDirectoryPath;
 
   @override
@@ -72,22 +67,11 @@ class _HomeScreenState extends State<HomeScreen>
     _pulseAnimation = Tween<double>(begin: 0.85, end: 1.0).animate(
       CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
     );
-    _webRTCService = WebRTCService();
-    _fileReceiver = FileReceiver();
-    _fileReceiver.setWebRTCService(_webRTCService); // Lier pour les ACK
-    _webRTCService.startSignalingServer();
-    _webRTCService.onTransferRequestReceived = _handleTransferRequest;
-    _webRTCService.onTransferResponse = _handleTransferResponse;
-    // Utiliser onChunkReceived (avec offset) plutôt que onDataReceived
-    _webRTCService.onChunkReceived = _handleChunkReceived;
-    _webRTCService.onControlMessage = _handleControlMessage;
-    // Écouter aussi les messages textuels pour file_complete
-    _webRTCService.onRawTextMessage = _handleRawTextMessage;
-    _webRTCService.onIceConnectionTypeChanged = (type) {
-      setState(() {
-        _iceConnectionType = type;
-      });
-    };
+    _httpService = HttpTransferService();
+    _httpService.startSignalingServer();
+    _httpService.onTransferRequestReceived = _handleTransferRequest;
+    _httpService.onTransferResponse = _handleTransferResponse;
+    _httpService.onControlMessage = _handleControlMessage;
     _deviceSearchController.addListener(() {
       setState(
         () => _deviceSearchQuery = _deviceSearchController.text.toLowerCase(),
@@ -118,7 +102,6 @@ class _HomeScreenState extends State<HomeScreen>
       final path = _receiveDirectoryPath!;
       try {
         if (Platform.isWindows) {
-          // Sur Windows, explorer.exe est 100% fiable
           await Process.run('explorer.exe', [path.replaceAll('/', '\\')]);
         } else {
           final Uri uri = Uri.file(path);
@@ -147,14 +130,10 @@ class _HomeScreenState extends State<HomeScreen>
           for (final uri in sharedFiles) {
             try {
               final uriString = uri.toString();
-              // Pour les URIs content://, on utilise file_picker pour les lire
               if (uriString.startsWith('content://')) {
-                // Pour les URIs content://, on doit utiliser une méthode native
-                // Pour l'instant, on saute les URIs content://
                 debugPrint('URI content:// détecté (non supporté): $uriString');
                 continue;
               } else {
-                // Pour les URIs file://, on peut créer directement un File
                 final cleanPath = uriString.replaceFirst('file://', '');
                 final file = File(cleanPath);
                 if (await file.exists()) {
@@ -182,7 +161,7 @@ class _HomeScreenState extends State<HomeScreen>
   void dispose() {
     _pulseController.dispose();
     _deviceSearchController.dispose();
-    _webRTCService.dispose();
+    _httpService.dispose();
     super.dispose();
   }
 
@@ -215,92 +194,8 @@ class _HomeScreenState extends State<HomeScreen>
         _isCancelled = true;
         _isTransferring = false;
         _statusMessage = 'Transfert annulé par l\'autre appareil';
-        if (_currentReceivingRequest != null) {
-          _fileReceiver.cancelTransfer(requestId);
-          _currentReceivingRequest = null;
-        }
-      });
-    }
-  }
-  /// Nouveau handler : reçoit les chunks avec offset (appelé par WebRTCService)
-  void _handleChunkReceived(Uint8List payload, int offset) {
-    debugPrint('📥 Chunk reçu: ${payload.length} bytes @ offset=$offset');
-    
-    if (_currentReceivingRequest != null) {
-      _fileReceiver.receiveChunkAtOffset(
-        _currentReceivingRequest!.id,
-        payload,
-        offset,
-      );
-
-      // Calculer la progression globale exacte en octets sur tous les fichiers
-      final totalReceived = _fileReceiver.getTotalReceivedBytes(_currentReceivingRequest!.id);
-      final globalProgress = _totalBytesToReceive > 0 ? totalReceived / _totalBytesToReceive : 0.0;
-
-      final currentFileIndex = _fileReceiver.getCurrentFileIndex();
-      final totalFiles = _fileReceiver.getTotalFiles();
-      final currentFileName =
-          _fileReceiver.getCurrentFileName() ??
-          _currentReceivingRequest!.files.first.name;
-
-      setState(() {
-        _progress = globalProgress;
-        _statusMessage = totalFiles > 1
-            ? 'Réception ($currentFileIndex/$totalFiles) : $currentFileName'
-            : 'Réception : $currentFileName';
-      });
-    } else {
-      debugPrint('⚠️ Chunk reçu mais pas de requête de transfert en cours');
-    }
-  }
-
-  /// Handler pour les messages textuels (file_complete, etc.)
-  void _handleRawTextMessage(Map<String, dynamic> data) {
-    final type = data['type'] as String?;
-    
-    if (type == 'file_complete') {
-      // L'émetteur a fini d'envoyer ce fichier
-      debugPrint('📥 file_complete reçu: ${data['fileName']}');
-      if (_currentReceivingRequest != null) {
-        _saveReceivedFile();
-      }
-    }
-  }
-
-  Future<void> _saveReceivedFile() async {
-    if (_currentReceivingRequest == null) return;
-
-    final filePath = await _fileReceiver.saveFile(_currentReceivingRequest!.id);
-    
-    if (filePath != null) {
-      // Vérifier s'il y a d'autres fichiers à recevoir
-      final currentIndex = _fileReceiver.getCurrentFileIndex();
-      final totalFiles = _fileReceiver.getTotalFiles();
-      
-      if (currentIndex < totalFiles) {
-        // Il y a encore des fichiers à recevoir
-        final nextFileName = _fileReceiver.getCurrentFileName() ?? 'Fichier suivant';
-        setState(() {
-          _statusMessage = 'Réception ($currentIndex/$totalFiles) : $nextFileName';
-          _progress = 0.0;
-        });
-        _showSnack('✅ Fichier reçu, prochain : $nextFileName');
-      } else {
-        // Tous les fichiers ont été reçus
-        setState(() {
-          _statusMessage = '✅ Transfert terminé !';
-          _progress = 0.0;
-          _isTransferring = false;
-        });
-        _showSnack('✅ Tous les fichiers enregistrés dans $_receiveDirectoryPath');
-
-        NotificationService().showNotification(
-          title: 'Transfert terminé',
-          body: '$totalFiles fichier(s) reçu(s)',
-        );
-
         _currentReceivingRequest = null;
-      }
+      });
     }
   }
 
@@ -330,7 +225,7 @@ class _HomeScreenState extends State<HomeScreen>
           TextButton(
             onPressed: () {
               Navigator.pop(context);
-              _webRTCService.sendTransferResponse(request.id, false);
+              _httpService.sendTransferResponse(request.id, false);
               setState(() {
                 _incomingRequests.remove(request);
               });
@@ -340,12 +235,53 @@ class _HomeScreenState extends State<HomeScreen>
           TextButton(
             onPressed: () async {
               Navigator.pop(context);
-              await _fileReceiver.startTransfer(request.id, request);
-              _webRTCService.sendTransferResponse(request.id, true);
+
+              // Calculer le total en octets
               int totalSize = 0;
-              for (final f in request.files) {
-                totalSize += f.size;
-              }
+              for (final f in request.files) totalSize += f.size;
+
+              // Préparer le répertoire de sauvegarde
+              final directory = await getApplicationDocumentsDirectory();
+              final saveDir = '${directory.path}/GoSend/received';
+              await Directory(saveDir).create(recursive: true);
+
+              // Démarrer le serveur de réception HTTP
+              await _httpService.startTransferServer(
+                request.id,
+                request.files,
+                saveDir,
+                (fileIndex, received, total) {
+                  setState(() {
+                    _currentReceivingRequest = request;
+                    _totalBytesToReceive = totalSize;
+                    _isTransferring = true;
+                    final globalReceived = received;
+                    _progress = totalSize > 0 ? globalReceived / totalSize : 0.0;
+                    _statusMessage = 'Réception : ${request.files[fileIndex].name}';
+                  });
+                },
+                (fileIndex, filePath) {
+                  debugPrint('✅ Fichier reçu: $filePath');
+                },
+                () {
+                  setState(() {
+                    _isTransferring = false;
+                    _progress = 0.0;
+                    _statusMessage = '✅ Transfert terminé !';
+                    _currentReceivingRequest = null;
+                  });
+                  _showSnack('✅ Tous les fichiers enregistrés !');
+
+                  NotificationService().showNotification(
+                    title: 'Transfert terminé',
+                    body: '${request.files.length} fichier(s) reçu(s)',
+                  );
+                },
+              );
+
+              // Accepter le transfert (l'émetteur va commencer l'envoi)
+              await _httpService.sendTransferResponse(request.id, true);
+
               setState(() {
                 _incomingRequests.remove(request);
                 _currentReceivingRequest = request;
@@ -367,28 +303,24 @@ class _HomeScreenState extends State<HomeScreen>
     final bool isMobile = MediaQuery.of(context).size.width <= 800;
     
     if ((isMobile && Platform.isAndroid) || Platform.isIOS) {
-      // Sur mobile : choisir entre photos, vidéos ou fichiers
       final choice = await showModalBottomSheet<String>(
         context: context,
         builder: (context) => SafeArea(
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              // Photos (utilise le picker natif Android/iOS)
               ListTile(
                 leading: const Icon(Icons.photo_library),
                 title: const Text('Photos'),
                 subtitle: const Text('Picker galerie natif'),
                 onTap: () => Navigator.pop(context, 'photos'),
               ),
-              // Vidéos
               ListTile(
                 leading: const Icon(Icons.videocam),
                 title: const Text('Vidéos'),
                 subtitle: const Text('Picker vidéo natif'),
                 onTap: () => Navigator.pop(context, 'videos'),
               ),
-              // Fichiers
               ListTile(
                 leading: const Icon(Icons.folder),
                 title: const Text('Fichiers'),
@@ -401,8 +333,6 @@ class _HomeScreenState extends State<HomeScreen>
       );
 
       if (choice == 'photos') {
-        // Utilise le picker d'images natif Android (galerie avec grille)
-        // pickMultiImage() ouvre le native Android Photo Picker
         final picker = ImagePicker();
         final pickedFiles = await picker.pickMultiImage();
         if (pickedFiles.isNotEmpty) {
@@ -413,7 +343,6 @@ class _HomeScreenState extends State<HomeScreen>
           });
         }
       } else if (choice == 'videos') {
-        // Picke une vidéo via le picker natif
         final picker = ImagePicker();
         final pickedFile = await picker.pickVideo(source: ImageSource.gallery);
         if (pickedFile != null) {
@@ -422,7 +351,6 @@ class _HomeScreenState extends State<HomeScreen>
           });
         }
       } else if (choice == 'files') {
-        // Sélecteur de fichiers standard
         final result = await FilePicker.platform.pickFiles(allowMultiple: true);
         if (result != null) {
           setState(() {
@@ -434,7 +362,6 @@ class _HomeScreenState extends State<HomeScreen>
         }
       }
     } else {
-      // Sur desktop : sélecteur de fichiers standard
       final result = await FilePicker.platform.pickFiles(allowMultiple: true);
       if (result != null) {
         setState(() {
@@ -463,7 +390,12 @@ class _HomeScreenState extends State<HomeScreen>
     });
 
     try {
-      await _webRTCService.connectToPeer(_selectedDevice!.ip);
+      // PAS de handshake WebRTC nécessaire, juste configurer l'IP
+      _httpService.connectToPeer(
+        _selectedDevice!.ip,
+        httpPort: _selectedDevice!.httpPort,
+      );
+
       setState(() {
         _isConnecting = false;
         _statusMessage = 'En attente d\'acceptation...';
@@ -488,7 +420,9 @@ class _HomeScreenState extends State<HomeScreen>
         timestamp: DateTime.now(),
       );
 
-      _webRTCService.sendTransferRequest(request);
+      // Envoyer la demande (le transfert démarrera après acceptation)
+      await _httpService.sendTransferRequest(request);
+      _currentTransferId = request.id;
     } catch (e) {
       setState(() {
         _isConnecting = false;
@@ -507,85 +441,26 @@ class _HomeScreenState extends State<HomeScreen>
     });
 
     try {
-      // Attendre que le DataChannel soit ouvert
-      if (_webRTCService.dataChannel?.state !=
-          RTCDataChannelState.RTCDataChannelOpen) {
-        setState(() {
-          _statusMessage = 'Attente connexion DataChannel...';
-        });
-        await Future.delayed(const Duration(seconds: 2));
-      }
-
-      final dataChannel = _webRTCService.dataChannel;
-      if (dataChannel == null ||
-          dataChannel.state != RTCDataChannelState.RTCDataChannelOpen) {
-        throw Exception('DataChannel non disponible');
-      }
-
-      // Calculer la taille totale des fichiers à envoyer
-      int totalBytesToSend = 0;
-      for (final file in _selectedFiles) {
-        totalBytesToSend += await file.length();
-      }
-      int totalBytesSentAlready = 0;
-
-      for (final file in _selectedFiles) {
-        if (_isCancelled) break;
-
-        final size = await file.length();
-        final fileName = file.path.split(Platform.pathSeparator).last;
-
-        final transferManager = OptimizedTransferManager(
-          dataChannel: dataChannel,
-          onProgress: (sent) {
-            final overallSent = totalBytesSentAlready + sent;
-            setState(() {
-              _progress = totalBytesToSend > 0 ? overallSent / totalBytesToSend : 0.0;
-              _statusMessage = 'Envoi : $fileName';
-            });
-          },
-          onComplete: () {
-            // Transfert terminé
-          },
-          onSpeedUpdate: (speedMBps) {
-            setState(() {
-              _statusMessage =
-                  'Envoi : $fileName (${speedMBps.toStringAsFixed(1)} MB/s)';
-            });
-          },
-          onStatusUpdate: (status) {
-            debugPrint('Transfer status: $status');
-          },
-        );
-
-        // Router les ACK vers ce manager
-        _webRTCService.onAckReceived = (data) {
-          transferManager.handleControlMessage(data);
-        };
-
-        if (_isPaused) {
-          transferManager.pause();
-        }
-
-        await transferManager.sendFile(file);
-        totalBytesSentAlready += size;
-
-        if (_isCancelled) break;
-      }
-
-      if (_isCancelled) return;
-
-      // Signaler la fin du transfert au récepteur
-      _webRTCService.sendTransferComplete();
-
-      setState(() {
-        _isTransferring = false;
-        _progress = 1.0;
-        _statusMessage = '✅ Envoi terminé !';
-        _selectedFiles = [];
-        _currentTransferId = null;
-      });
-      _showSnack('✅ Fichiers envoyés avec succès !');
+      await _httpService.sendFiles(
+        _selectedFiles,
+        _currentTransferId!,
+        (totalSent, totalSize) {
+          setState(() {
+            _progress = totalSize > 0 ? totalSent / totalSize : 0.0;
+            _statusMessage = 'Envoi en cours...';
+          });
+        },
+        () {
+          setState(() {
+            _isTransferring = false;
+            _progress = 1.0;
+            _statusMessage = '✅ Envoi terminé !';
+            _selectedFiles = [];
+            _currentTransferId = null;
+          });
+          _showSnack('✅ Fichiers envoyés avec succès !');
+        },
+      );
     } catch (e) {
       setState(() {
         _isConnecting = false;
@@ -854,7 +729,6 @@ class _HomeScreenState extends State<HomeScreen>
                 ),
                 const SizedBox(height: 12),
                 Expanded(child: _buildDevicesSection(isMobile: false)),
-                // ─── Dossier de réception en bas du panel ───
                 if (_receiveDirectoryPath != null) ...[
                   const Divider(height: 1),
                   InkWell(
@@ -904,7 +778,6 @@ class _HomeScreenState extends State<HomeScreen>
           Expanded(
             child: Column(
               children: [
-                // Header
                 Container(
                   padding: const EdgeInsets.fromLTRB(32, 32, 32, 16),
                   child: Row(
@@ -915,7 +788,6 @@ class _HomeScreenState extends State<HomeScreen>
                     ],
                   ),
                 ),
-                // Zone fichiers + drop
                 Expanded(
                   child: Padding(
                     padding: const EdgeInsets.fromLTRB(32, 0, 32, 32),
@@ -1022,42 +894,6 @@ class _HomeScreenState extends State<HomeScreen>
             _statusMessage,
             style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
           ),
-          if (_iceConnectionType.isNotEmpty &&
-              _iceConnectionType != 'En attente...') ...[
-            const SizedBox(width: 8),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-              decoration: BoxDecoration(
-                color: _iceConnectionType == 'direct'
-                    ? Colors.green.withAlpha(30)
-                    : Colors.orange.withAlpha(30),
-                borderRadius: BorderRadius.circular(10),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    _iceConnectionType == 'direct' ? Icons.wifi : Icons.cloud,
-                    size: 10,
-                    color: _iceConnectionType == 'direct'
-                        ? Colors.green
-                        : Colors.orange,
-                  ),
-                  const SizedBox(width: 4),
-                  Text(
-                    _iceConnectionType == 'direct' ? 'LAN' : 'NAT',
-                    style: TextStyle(
-                      fontSize: 10,
-                      fontWeight: FontWeight.w600,
-                      color: _iceConnectionType == 'direct'
-                          ? Colors.green
-                          : Colors.orange,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
         ],
       ),
     );
@@ -1092,7 +928,6 @@ class _HomeScreenState extends State<HomeScreen>
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            // Header de la zone
             Row(
               children: [
                 Icon(
@@ -1131,12 +966,10 @@ class _HomeScreenState extends State<HomeScreen>
               ],
             ),
             const SizedBox(height: 16),
-            // Zone vide ou liste
             if (_selectedFiles.isEmpty)
               _buildEmptyDropZone(isMobile: isMobile)
             else
               _buildFilesList(),
-            // Barre de progression
             if (_isTransferring) ...[
               const SizedBox(height: 16),
               ClipRRect(
@@ -1179,12 +1012,12 @@ class _HomeScreenState extends State<HomeScreen>
                         onPressed: () {
                           final action = _isPaused ? 'resume' : 'pause';
                           if (_currentReceivingRequest != null) {
-                            _webRTCService.sendControlMessage(
+                            _httpService.sendControlMessage(
                               _currentReceivingRequest!.id,
                               action,
                             );
                           } else if (_currentTransferId != null) {
-                            _webRTCService.sendControlMessage(
+                            _httpService.sendControlMessage(
                               _currentTransferId!,
                               action,
                             );
@@ -1200,15 +1033,12 @@ class _HomeScreenState extends State<HomeScreen>
                         ),
                         onPressed: () {
                           if (_currentReceivingRequest != null) {
-                            _webRTCService.sendControlMessage(
+                            _httpService.sendControlMessage(
                               _currentReceivingRequest!.id,
                               'cancel',
                             );
-                            _fileReceiver.cancelTransfer(
-                              _currentReceivingRequest!.id,
-                            );
                           } else if (_currentTransferId != null) {
-                            _webRTCService.sendControlMessage(
+                            _httpService.sendControlMessage(
                               _currentTransferId!,
                               'cancel',
                             );
@@ -1311,7 +1141,6 @@ class _HomeScreenState extends State<HomeScreen>
       ),
       child: Row(
         children: [
-          // Vraie miniature pour les images, icône sinon
           ClipRRect(
             borderRadius: BorderRadius.circular(8),
             child: isImage
@@ -1413,7 +1242,6 @@ class _HomeScreenState extends State<HomeScreen>
     return Column(
       mainAxisSize: isMobile ? MainAxisSize.min : MainAxisSize.max,
       children: [
-        // Barre de recherche (compacte sur PC)
         if (!isMobile && widget.devices.isNotEmpty) ...[
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
@@ -1455,10 +1283,8 @@ class _HomeScreenState extends State<HomeScreen>
           ),
           const SizedBox(height: 4),
         ],
-        // Appareil local
         _buildLocalDeviceCard(isMobile),
         const SizedBox(height: 12),
-        // Liste des appareils découverts (filtrés)
         if (isMobile)
           filteredDevices.isEmpty
               ? _buildEmptyDevicesState(isMobile)
