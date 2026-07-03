@@ -1,17 +1,17 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
+import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 class OptimizedTransferManager {
-  // Tailles de chunks adaptatives
-  static const int minChunkSize = 256 * 1024; // 256 KB
-  static const int maxChunkSize = 2 * 1024 * 1024; // 2 MB
-  static const int bufferedAmountLowThreshold = 4 * 1024 * 1024; // 4 MB
-  static const int bufferedAmountHighThreshold = 16 * 1024 * 1024; // 16 MB
+  static const int minChunkSize = 90 * 1024; // 32 KB
+  static const int maxChunkSize = 90 * 1024; // 60 KB (taille de sécurité maximale SCTP)
+  static const int bufferedAmountLowThreshold = 256 * 1024; // 256 KB
+  static const int bufferedAmountHighThreshold = 1024 * 1024; // 1 MB
 
-  int _currentChunkSize = minChunkSize;
+  int _currentChunkSize = maxChunkSize; // Démarrer directement à la taille maximale de sécurité pour un débit optimal
   int _consecutiveSuccesses = 0;
   int _consecutiveFailures = 0;
   final int _maxSuccessesBeforeIncrease = 10;
@@ -23,10 +23,22 @@ class OptimizedTransferManager {
   final Function(double)? onSpeedUpdate;
   final Function(String)? onStatusUpdate;
 
+  /// Callback pour que le manager reçoive les ACK sans écraser onMessage
+  Function(Map<String, dynamic>)? onControlMessage;
+
   bool _isPaused = false;
   bool _isCancelled = false;
   DateTime? _lastSpeedUpdate;
   int _bytesSinceLastUpdate = 0;
+
+  // Protocole résumable
+  int _lastAckOffset = 0;
+  Completer<void>? _ackCompleter;
+  // L'attente d'ACK bloquante a été supprimée au profit du streaming en continu régulé par le buffer d'envoi
+
+  /// ID unique du manager pour ne pas confondre les ACK
+  final String _managerId = DateTime.now().microsecondsSinceEpoch.toString();
+  String _currentFileName = '';
 
   OptimizedTransferManager({
     required this.dataChannel,
@@ -34,119 +46,156 @@ class OptimizedTransferManager {
     required this.onComplete,
     this.onSpeedUpdate,
     this.onStatusUpdate,
-  });
+  }) {
+    // NE PAS toucher à dataChannel.onMessage ici !
+    // Les ACK seront routés via onControlMessage
+  }
+
+  /// Route un message de contrôle vers ce manager
+  /// Appelé depuis WebRTCService pour les messages 'ack'
+  bool handleControlMessage(Map<String, dynamic> data) {
+    final type = data['type'] as String?;
+    
+    if (type == 'ack') {
+      final ackOffset = (data['offset'] is int) 
+          ? data['offset'] as int 
+          : int.parse(data['offset'].toString());
+      
+      _lastAckOffset = ackOffset;
+      
+      if (_ackCompleter != null && !_ackCompleter!.isCompleted) {
+        _ackCompleter!.complete();
+        return true;
+      }
+    }
+    return false;
+  }
 
   Future<void> sendFile(File file) async {
     final fileLength = await file.length();
-    int offset = 0;
+
+    int offset = _lastAckOffset;
+    if (offset > fileLength) {
+      offset = 0;
+    }
+
     _lastSpeedUpdate = DateTime.now();
     _bytesSinceLastUpdate = 0;
 
-    final raf = await file.open(mode: FileMode.read);
+    _currentFileName = file.path.split(Platform.pathSeparator).last;
+    
+    // Send start metadata
+    _sendControl({
+      'type': 'start',
+      'fileName': _currentFileName,
+      'fileSize': fileLength,
+      'chunkSize': _currentChunkSize,
+    });
 
-    while (offset < fileLength && !_isCancelled) {
-      if (_isPaused) {
-        await Future.delayed(const Duration(milliseconds: 100));
-        continue;
-      }
+    debugPrint('📤 Envoi fichier: $_currentFileName ($fileLength bytes) depuis offset=$offset');
 
-      // Vérifier le buffer WebRTC
-      if (dataChannel.bufferedAmount != null &&
-          dataChannel.bufferedAmount! > bufferedAmountHighThreshold) {
-        _onStatus('Buffer plein, attente...');
-        await _waitForBufferLow();
+    final raf = await file.open();
+    try {
+      while (offset < fileLength) {
         if (_isCancelled) break;
+
+        if (_isPaused) {
+          await Future.delayed(const Duration(milliseconds: 200));
+          continue;
+        }
+
+        final toRead = math.min(_currentChunkSize, fileLength - offset);
+
+        await raf.setPosition(offset);
+        final bytes = await raf.read(toRead);
+        if (bytes.isEmpty) break;
+
+        // Prefix chunk with 8-byte header
+        final header = ByteData(8)..setUint64(0, offset, Endian.big);
+        final out = Uint8List(8 + bytes.length);
+        out.setRange(0, 8, header.buffer.asUint8List());
+        out.setRange(8, 8 + bytes.length, bytes);
+
+        // Gestion du buffer
+        if ((dataChannel.bufferedAmount ?? 0) > bufferedAmountHighThreshold) {
+          _onStatus('Buffer plein, attente...');
+          await _waitForBufferLow();
+          if (_isCancelled) break;
+        }
+
+        // Envoyer le chunk directement (WebRTC SCTP s'occupe de la fiabilité en arrière-plan)
+        dataChannel.send(RTCDataChannelMessage.fromBinary(out));
+
+        // Avancer l'offset localement
+        offset += bytes.length;
+        onProgress(offset);
+        _bytesSinceLastUpdate += bytes.length;
+        _updateSpeedMetrics();
+        _adjustChunkSize(dataChannel.bufferedAmount ?? 0);
+
+        // Laisser respirer la boucle Dart pour traiter les événements réseau
+        await Future.delayed(const Duration(milliseconds: 1));
       }
 
-      // Calculer la taille du chunk à lire
-      final remainingBytes = fileLength - offset;
-      final chunkSize = _currentChunkSize > remainingBytes
-          ? remainingBytes
-          : _currentChunkSize;
-
-      // Lecture du chunk avec openRead pour un streaming efficace
-      final chunk = await raf.read(chunkSize);
-      if (chunk.isEmpty) break;
-
-      // Envoi via WebRTC
-      dataChannel.send(
-        RTCDataChannelMessage.fromBinary(Uint8List.fromList(chunk)),
-      );
-
-      offset += chunk.length;
-      _bytesSinceLastUpdate += chunk.length;
-      onProgress(offset);
-
-      // Mise à jour des métriques de vitesse
-      _updateSpeedMetrics();
-
-      // Ajustement adaptatif de la taille des chunks
-      _adjustChunkSize(dataChannel.bufferedAmount ?? 0);
+      if (!_isCancelled) {
+        _sendControl({
+          'type': 'file_complete',
+          'fileName': _currentFileName,
+          'fileSize': fileLength,
+        });
+        debugPrint('📤 Fichier terminé: $_currentFileName');
+      }
+    } finally {
+      await raf.close();
     }
+  }
 
-    await raf.close();
+  void sendAllComplete() {
+    _sendControl({'type': 'end'});
+    debugPrint('📤 Tous les fichiers envoyés');
+    onComplete();
+  }
 
-    if (!_isCancelled) {
-      debugPrint('Transfert terminé: $fileLength octets');
-      onComplete();
+  void _sendControl(Map<String, dynamic> m) {
+    try {
+      dataChannel.send(RTCDataChannelMessage(json.encode(m)));
+    } catch (e) {
+      debugPrint('Error sending control: $e');
     }
   }
 
   Future<void> _waitForBufferLow() async {
-    if (dataChannel.bufferedAmountLowThreshold == null) {
-      dataChannel.bufferedAmountLowThreshold = bufferedAmountLowThreshold;
-    }
+    dataChannel.bufferedAmountLowThreshold = bufferedAmountLowThreshold;
 
     final completer = Completer<void>();
-
     dataChannel.onBufferedAmountLow = (_) {
-      if (!completer.isCompleted) {
-        completer.complete();
-      }
+      if (!completer.isCompleted) completer.complete();
     };
 
-    // Timeout de sécurité
     Future.delayed(const Duration(seconds: 30), () {
-      if (!completer.isCompleted) {
-        completer.complete();
-      }
+      if (!completer.isCompleted) completer.complete();
     });
 
     await completer.future;
-
-    // Restaurer le callback original
     dataChannel.onBufferedAmountLow = null;
   }
 
   void _adjustChunkSize(int bufferedAmount) {
-    // Si le buffer est faible, on peut augmenter la taille des chunks
     if (bufferedAmount < bufferedAmountLowThreshold) {
       _consecutiveSuccesses++;
       _consecutiveFailures = 0;
-
-      if (_consecutiveSuccesses >= _maxSuccessesBeforeIncrease &&
-          _currentChunkSize < maxChunkSize) {
-        _currentChunkSize = (_currentChunkSize * 2).clamp(
-          minChunkSize,
-          maxChunkSize,
-        );
+      if (_consecutiveSuccesses >= _maxSuccessesBeforeIncrease && _currentChunkSize < maxChunkSize) {
+        _currentChunkSize = (_currentChunkSize * 2).clamp(minChunkSize, maxChunkSize);
         _consecutiveSuccesses = 0;
-        debugPrint('Chunk size augmenté à ${_currentChunkSize ~/ 1024} KB');
+        debugPrint('Chunk augmenté: ${_currentChunkSize ~/ 1024} KB');
       }
-    }
-    // Si le buffer est élevé, on réduit la taille des chunks
-    else if (bufferedAmount > bufferedAmountLowThreshold * 2) {
+    } else if (bufferedAmount > bufferedAmountLowThreshold * 2) {
       _consecutiveFailures++;
       _consecutiveSuccesses = 0;
-
-      if (_consecutiveFailures >= _maxFailuresBeforeDecrease &&
-          _currentChunkSize > minChunkSize) {
-        _currentChunkSize = (_currentChunkSize ~/ 2).clamp(
-          minChunkSize,
-          maxChunkSize,
-        );
+      if (_consecutiveFailures >= _maxFailuresBeforeDecrease && _currentChunkSize > minChunkSize) {
+        _currentChunkSize = (_currentChunkSize ~/ 2).clamp(minChunkSize, maxChunkSize);
         _consecutiveFailures = 0;
-        debugPrint('Chunk size réduit à ${_currentChunkSize ~/ 1024} KB');
+        debugPrint('Chunk réduit: ${_currentChunkSize ~/ 1024} KB');
       }
     }
   }
@@ -156,9 +205,7 @@ class OptimizedTransferManager {
     if (_lastSpeedUpdate != null) {
       final elapsed = now.difference(_lastSpeedUpdate!).inMilliseconds;
       if (elapsed >= 500) {
-        // Mise à jour toutes les 500ms
-        final speedMBps =
-            (_bytesSinceLastUpdate / (1024 * 1024)) / (elapsed / 1000);
+        final speedMBps = (_bytesSinceLastUpdate / (1024 * 1024)) / (elapsed / 1000);
         onSpeedUpdate?.call(speedMBps);
         _bytesSinceLastUpdate = 0;
         _lastSpeedUpdate = now;
@@ -173,19 +220,23 @@ class OptimizedTransferManager {
 
   void pause() {
     _isPaused = true;
-    _onStatus('Transfert en pause');
+    _onStatus('⏸️ Pause');
   }
 
   void resume() {
     _isPaused = false;
-    _onStatus('Transfert repris');
+    _onStatus('▶️ Reprise');
   }
 
   void cancel() {
     _isCancelled = true;
-    _onStatus('Transfert annulé');
+    if (_ackCompleter != null && !_ackCompleter!.isCompleted) {
+      _ackCompleter!.completeError(Exception('Annulé'));
+    }
+    _onStatus('⏹️ Annulé');
   }
 
   int getCurrentChunkSize() => _currentChunkSize;
   int getBufferedAmount() => dataChannel.bufferedAmount ?? 0;
+  String get managerId => _managerId;
 }

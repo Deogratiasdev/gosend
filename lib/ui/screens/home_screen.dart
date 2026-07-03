@@ -1,24 +1,21 @@
 import 'dart:io';
-import 'dart:typed_data';
-import 'package:flutter/services.dart';
-import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:image_picker/image_picker.dart';
-import 'package:uuid/uuid.dart';
-import '../../core/db/history_db.dart';
+import 'package:path_provider/path_provider.dart';
 import '../../core/network/discovery_service.dart';
 import '../../core/network/webrtc_service.dart';
 import '../../core/notifications/notification_service.dart';
 import '../../core/transfer/file_receiver.dart';
 import '../../core/transfer/optimized_transfer_manager.dart';
 import '../../models/device.dart';
-import '../../models/history_item.dart';
 import '../../models/transfer_request.dart';
-import 'history_screen.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 class HomeScreen extends StatefulWidget {
   final List<Device> devices;
@@ -48,11 +45,12 @@ class _HomeScreenState extends State<HomeScreen>
   bool _isConnecting = false;
   bool _isTransferring = false;
   double _progress = 0.0;
+  int _totalBytesToReceive = 0;
   String _statusMessage = 'Prêt à envoyer';
   late AnimationController _pulseController;
   late Animation<double> _pulseAnimation;
-  final WebRTCService _webRTCService = WebRTCService();
-  final FileReceiver _fileReceiver = FileReceiver();
+  late final WebRTCService _webRTCService;
+  late final FileReceiver _fileReceiver;
   final List<TransferRequest> _incomingRequests = [];
   TransferRequest? _currentReceivingRequest;
   String? _currentTransferId;
@@ -62,6 +60,7 @@ class _HomeScreenState extends State<HomeScreen>
   String _deviceSearchQuery = '';
   static const platform = MethodChannel('com.example.gosend/share');
   String _iceConnectionType = 'En attente...';
+  String? _receiveDirectoryPath;
 
   @override
   void initState() {
@@ -73,11 +72,17 @@ class _HomeScreenState extends State<HomeScreen>
     _pulseAnimation = Tween<double>(begin: 0.85, end: 1.0).animate(
       CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
     );
+    _webRTCService = WebRTCService();
+    _fileReceiver = FileReceiver();
+    _fileReceiver.setWebRTCService(_webRTCService); // Lier pour les ACK
     _webRTCService.startSignalingServer();
     _webRTCService.onTransferRequestReceived = _handleTransferRequest;
     _webRTCService.onTransferResponse = _handleTransferResponse;
-    _webRTCService.onDataReceived = _handleDataReceived;
+    // Utiliser onChunkReceived (avec offset) plutôt que onDataReceived
+    _webRTCService.onChunkReceived = _handleChunkReceived;
     _webRTCService.onControlMessage = _handleControlMessage;
+    // Écouter aussi les messages textuels pour file_complete
+    _webRTCService.onRawTextMessage = _handleRawTextMessage;
     _webRTCService.onIceConnectionTypeChanged = (type) {
       setState(() {
         _iceConnectionType = type;
@@ -89,6 +94,45 @@ class _HomeScreenState extends State<HomeScreen>
       );
     });
     _checkSharedFiles();
+    _getReceiveDirectory();
+  }
+
+  Future<void> _getReceiveDirectory() async {
+    try {
+      final directory = await getApplicationDocumentsDirectory();
+      final savePath = '${directory.path}/GoSend/received';
+      final saveDir = Directory(savePath);
+      if (!await saveDir.exists()) {
+        await saveDir.create(recursive: true);
+      }
+      setState(() {
+        _receiveDirectoryPath = savePath;
+      });
+    } catch (e) {
+      debugPrint('Error getting receive directory: $e');
+    }
+  }
+
+  Future<void> _openReceiveDirectory() async {
+    if (_receiveDirectoryPath != null) {
+      final path = _receiveDirectoryPath!;
+      try {
+        if (Platform.isWindows) {
+          // Sur Windows, explorer.exe est 100% fiable
+          await Process.run('explorer.exe', [path.replaceAll('/', '\\')]);
+        } else {
+          final Uri uri = Uri.file(path);
+          if (await canLaunchUrl(uri)) {
+            await launchUrl(uri);
+          } else {
+            await launchUrl(uri, mode: LaunchMode.externalApplication);
+          }
+        }
+      } catch (e) {
+        debugPrint('Erreur ouverture dossier: $e');
+        _showSnack('Erreur ouverture dossier : $e');
+      }
+    }
   }
 
   Future<void> _checkSharedFiles() async {
@@ -178,19 +222,23 @@ class _HomeScreenState extends State<HomeScreen>
       });
     }
   }
-
-  void _handleDataReceived(Uint8List data) {
+  /// Nouveau handler : reçoit les chunks avec offset (appelé par WebRTCService)
+  void _handleChunkReceived(Uint8List payload, int offset) {
+    debugPrint('📥 Chunk reçu: ${payload.length} bytes @ offset=$offset');
+    
     if (_currentReceivingRequest != null) {
-      final progress = _fileReceiver.receiveChunk(
+      _fileReceiver.receiveChunkAtOffset(
         _currentReceivingRequest!.id,
-        data,
+        payload,
+        offset,
       );
 
-      // Calculer la progression globale sur tous les fichiers
+      // Calculer la progression globale exacte en octets sur tous les fichiers
+      final totalReceived = _fileReceiver.getTotalReceivedBytes(_currentReceivingRequest!.id);
+      final globalProgress = _totalBytesToReceive > 0 ? totalReceived / _totalBytesToReceive : 0.0;
+
       final currentFileIndex = _fileReceiver.getCurrentFileIndex();
       final totalFiles = _fileReceiver.getTotalFiles();
-      final globalProgress = (currentFileIndex + progress) / totalFiles;
-
       final currentFileName =
           _fileReceiver.getCurrentFileName() ??
           _currentReceivingRequest!.files.first.name;
@@ -201,8 +249,19 @@ class _HomeScreenState extends State<HomeScreen>
             ? 'Réception ($currentFileIndex/$totalFiles) : $currentFileName'
             : 'Réception : $currentFileName';
       });
+    } else {
+      debugPrint('⚠️ Chunk reçu mais pas de requête de transfert en cours');
+    }
+  }
 
-      if (progress >= 1.0) {
+  /// Handler pour les messages textuels (file_complete, etc.)
+  void _handleRawTextMessage(Map<String, dynamic> data) {
+    final type = data['type'] as String?;
+    
+    if (type == 'file_complete') {
+      // L'émetteur a fini d'envoyer ce fichier
+      debugPrint('📥 file_complete reçu: ${data['fileName']}');
+      if (_currentReceivingRequest != null) {
         _saveReceivedFile();
       }
     }
@@ -212,31 +271,36 @@ class _HomeScreenState extends State<HomeScreen>
     if (_currentReceivingRequest == null) return;
 
     final filePath = await _fileReceiver.saveFile(_currentReceivingRequest!.id);
+    
     if (filePath != null) {
-      setState(() {
-        _statusMessage = '✅ Fichier reçu : $filePath';
-        _progress = 0.0;
-      });
-      _showSnack('✅ Fichier enregistré avec succès !');
+      // Vérifier s'il y a d'autres fichiers à recevoir
+      final currentIndex = _fileReceiver.getCurrentFileIndex();
+      final totalFiles = _fileReceiver.getTotalFiles();
+      
+      if (currentIndex < totalFiles) {
+        // Il y a encore des fichiers à recevoir
+        final nextFileName = _fileReceiver.getCurrentFileName() ?? 'Fichier suivant';
+        setState(() {
+          _statusMessage = 'Réception ($currentIndex/$totalFiles) : $nextFileName';
+          _progress = 0.0;
+        });
+        _showSnack('✅ Fichier reçu, prochain : $nextFileName');
+      } else {
+        // Tous les fichiers ont été reçus
+        setState(() {
+          _statusMessage = '✅ Transfert terminé !';
+          _progress = 0.0;
+          _isTransferring = false;
+        });
+        _showSnack('✅ Tous les fichiers enregistrés dans $_receiveDirectoryPath');
 
-      NotificationService().showNotification(
-        title: 'Transfert terminé',
-        body: 'Fichier ${_currentReceivingRequest!.files.first.name} reçu',
-      );
+        NotificationService().showNotification(
+          title: 'Transfert terminé',
+          body: '$totalFiles fichier(s) reçu(s)',
+        );
 
-      final historyItem = HistoryItem(
-        id: const Uuid().v4(),
-        type: 'receive',
-        peerName: _currentReceivingRequest!.senderName,
-        fileName: _currentReceivingRequest!.files.first.name,
-        filePath: filePath,
-        size: _currentReceivingRequest!.files.first.size,
-        timestamp: DateTime.now().millisecondsSinceEpoch,
-        status: 'completed',
-      );
-      HistoryDB.instance.insertItem(historyItem);
-
-      _currentReceivingRequest = null;
+        _currentReceivingRequest = null;
+      }
     }
   }
 
@@ -245,20 +309,22 @@ class _HomeScreenState extends State<HomeScreen>
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Demande de transfert'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('De: ${request.senderName}'),
-            const SizedBox(height: 8),
-            const Text('Fichiers:'),
-            ...request.files.map(
-              (file) => Padding(
-                padding: const EdgeInsets.only(left: 16, top: 4),
-                child: Text('• ${file.name} (${_formatSize(file.size)})'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('De: ${request.senderName}'),
+              const SizedBox(height: 8),
+              const Text('Fichiers:'),
+              ...request.files.map(
+                (file) => Padding(
+                  padding: const EdgeInsets.only(left: 16, top: 4),
+                  child: Text('• ${file.name} (${_formatSize(file.size)})'),
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
         actions: [
           TextButton(
@@ -276,9 +342,14 @@ class _HomeScreenState extends State<HomeScreen>
               Navigator.pop(context);
               await _fileReceiver.startTransfer(request.id, request);
               _webRTCService.sendTransferResponse(request.id, true);
+              int totalSize = 0;
+              for (final f in request.files) {
+                totalSize += f.size;
+              }
               setState(() {
                 _incomingRequests.remove(request);
                 _currentReceivingRequest = request;
+                _totalBytesToReceive = totalSize;
                 _isCancelled = false;
                 _isPaused = false;
                 _isTransferring = true;
@@ -293,52 +364,77 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   Future<void> _pickFiles() async {
-    if (MediaQuery.of(context).size.width <= 800 && Platform.isAndroid ||
-        Platform.isIOS) {
-      showModalBottomSheet(
+    final bool isMobile = MediaQuery.of(context).size.width <= 800;
+    
+    if ((isMobile && Platform.isAndroid) || Platform.isIOS) {
+      // Sur mobile : choisir entre photos, vidéos ou fichiers
+      final choice = await showModalBottomSheet<String>(
         context: context,
         builder: (context) => SafeArea(
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
+              // Photos (utilise le picker natif Android/iOS)
               ListTile(
                 leading: const Icon(Icons.photo_library),
-                title: const Text('Images / Vidéos (Galerie)'),
-                onTap: () async {
-                  Navigator.pop(context);
-                  final picker = ImagePicker();
-                  final pickedFiles = await picker.pickMultipleMedia();
-                  if (pickedFiles.isNotEmpty) {
-                    setState(() {
-                      _selectedFiles.addAll(
-                        pickedFiles.map((x) => File(x.path)),
-                      );
-                    });
-                  }
-                },
+                title: const Text('Photos'),
+                subtitle: const Text('Picker galerie natif'),
+                onTap: () => Navigator.pop(context, 'photos'),
               ),
+              // Vidéos
+              ListTile(
+                leading: const Icon(Icons.videocam),
+                title: const Text('Vidéos'),
+                subtitle: const Text('Picker vidéo natif'),
+                onTap: () => Navigator.pop(context, 'videos'),
+              ),
+              // Fichiers
               ListTile(
                 leading: const Icon(Icons.folder),
                 title: const Text('Fichiers'),
-                onTap: () async {
-                  Navigator.pop(context);
-                  final result = await FilePicker.platform.pickFiles(
-                    allowMultiple: true,
-                  );
-                  if (result != null) {
-                    setState(() {
-                      _selectedFiles.addAll(
-                        result.paths.whereType<String>().map(File.new),
-                      );
-                    });
-                  }
-                },
+                subtitle: const Text('Sélecteur de fichiers'),
+                onTap: () => Navigator.pop(context, 'files'),
               ),
             ],
           ),
         ),
       );
+
+      if (choice == 'photos') {
+        // Utilise le picker d'images natif Android (galerie avec grille)
+        // pickMultiImage() ouvre le native Android Photo Picker
+        final picker = ImagePicker();
+        final pickedFiles = await picker.pickMultiImage();
+        if (pickedFiles.isNotEmpty) {
+          setState(() {
+            _selectedFiles.addAll(
+              pickedFiles.map((x) => File(x.path)),
+            );
+          });
+        }
+      } else if (choice == 'videos') {
+        // Picke une vidéo via le picker natif
+        final picker = ImagePicker();
+        final pickedFile = await picker.pickVideo(source: ImageSource.gallery);
+        if (pickedFile != null) {
+          setState(() {
+            _selectedFiles.add(File(pickedFile.path));
+          });
+        }
+      } else if (choice == 'files') {
+        // Sélecteur de fichiers standard
+        final result = await FilePicker.platform.pickFiles(allowMultiple: true);
+        if (result != null) {
+          setState(() {
+            _selectedFiles = result.paths
+                .whereType<String>()
+                .map(File.new)
+                .toList();
+          });
+        }
+      }
     } else {
+      // Sur desktop : sélecteur de fichiers standard
       final result = await FilePicker.platform.pickFiles(allowMultiple: true);
       if (result != null) {
         setState(() {
@@ -426,6 +522,13 @@ class _HomeScreenState extends State<HomeScreen>
         throw Exception('DataChannel non disponible');
       }
 
+      // Calculer la taille totale des fichiers à envoyer
+      int totalBytesToSend = 0;
+      for (final file in _selectedFiles) {
+        totalBytesToSend += await file.length();
+      }
+      int totalBytesSentAlready = 0;
+
       for (final file in _selectedFiles) {
         if (_isCancelled) break;
 
@@ -435,24 +538,14 @@ class _HomeScreenState extends State<HomeScreen>
         final transferManager = OptimizedTransferManager(
           dataChannel: dataChannel,
           onProgress: (sent) {
+            final overallSent = totalBytesSentAlready + sent;
             setState(() {
-              _progress = sent / size;
+              _progress = totalBytesToSend > 0 ? overallSent / totalBytesToSend : 0.0;
               _statusMessage = 'Envoi : $fileName';
             });
           },
           onComplete: () {
-            // Enregistrer dans l'historique
-            final historyItem = HistoryItem(
-              id: const Uuid().v4(),
-              type: 'send',
-              peerName: _selectedDevice?.name ?? 'Inconnu',
-              fileName: fileName,
-              filePath: file.path,
-              size: size,
-              timestamp: DateTime.now().millisecondsSinceEpoch,
-              status: 'completed',
-            );
-            HistoryDB.instance.insertItem(historyItem);
+            // Transfert terminé
           },
           onSpeedUpdate: (speedMBps) {
             setState(() {
@@ -465,16 +558,25 @@ class _HomeScreenState extends State<HomeScreen>
           },
         );
 
+        // Router les ACK vers ce manager
+        _webRTCService.onAckReceived = (data) {
+          transferManager.handleControlMessage(data);
+        };
+
         if (_isPaused) {
           transferManager.pause();
         }
 
         await transferManager.sendFile(file);
+        totalBytesSentAlready += size;
 
         if (_isCancelled) break;
       }
 
       if (_isCancelled) return;
+
+      // Signaler la fin du transfert au récepteur
+      _webRTCService.sendTransferComplete();
 
       setState(() {
         _isTransferring = false;
@@ -590,31 +692,9 @@ class _HomeScreenState extends State<HomeScreen>
             ),
           ),
           IconButton(
-            icon: const Icon(Icons.history),
-            tooltip: 'Historique',
-            onPressed: () => Navigator.push(
-              context,
-              PageRouteBuilder(
-                pageBuilder: (c, a, b) => const HistoryScreen(),
-                transitionsBuilder: (c, a, b, child) => FadeTransition(
-                  opacity: a,
-                  child: SlideTransition(
-                    position:
-                        Tween<Offset>(
-                          begin: const Offset(0, 0.05),
-                          end: Offset.zero,
-                        ).animate(
-                          CurvedAnimation(
-                            parent: a,
-                            curve: Curves.easeOutCubic,
-                          ),
-                        ),
-                    child: child,
-                  ),
-                ),
-                transitionDuration: const Duration(milliseconds: 300),
-              ),
-            ),
+            icon: const Icon(Icons.folder_open),
+            tooltip: 'Dossier de réception',
+            onPressed: _openReceiveDirectory,
           ),
           PopupMenuButton<String>(
             icon: const Icon(Icons.more_vert),
@@ -774,53 +854,48 @@ class _HomeScreenState extends State<HomeScreen>
                 ),
                 const SizedBox(height: 12),
                 Expanded(child: _buildDevicesSection(isMobile: false)),
-                // ─── Historique en bas du panel ───
-                const Divider(height: 1),
-                InkWell(
-                  borderRadius: const BorderRadius.only(
-                    bottomRight: Radius.circular(20),
-                  ),
-                  onTap: () => Navigator.push(
-                    context,
-                    PageRouteBuilder(
-                      pageBuilder: (c, a, b) => const HistoryScreen(),
-                      transitionsBuilder: (c, a, b, child) =>
-                          FadeTransition(opacity: a, child: child),
-                      transitionDuration: const Duration(milliseconds: 250),
+                // ─── Dossier de réception en bas du panel ───
+                if (_receiveDirectoryPath != null) ...[
+                  const Divider(height: 1),
+                  InkWell(
+                    borderRadius: const BorderRadius.only(
+                      bottomRight: Radius.circular(20),
                     ),
-                  ),
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 20,
-                      vertical: 16,
-                    ),
-                    child: Row(
-                      children: [
-                        Icon(
-                          Icons.history_rounded,
-                          size: 20,
-                          color: colorScheme.onSurfaceVariant,
-                        ),
-                        const SizedBox(width: 12),
-                        Text(
-                          'Historique',
-                          style: GoogleFonts.plusJakartaSans(
-                            fontSize: 14,
-                            fontWeight: FontWeight.w600,
+                    onTap: _openReceiveDirectory,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 20,
+                        vertical: 16,
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(
+                            Icons.folder_open_rounded,
+                            size: 20,
                             color: colorScheme.onSurfaceVariant,
                           ),
-                        ),
-                        const Spacer(),
-                        Icon(
-                          Icons.chevron_right_rounded,
-                          size: 18,
-                          color: colorScheme.onSurfaceVariant,
-                        ),
-                      ],
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Text(
+                              'Dossier de réception',
+                              style: GoogleFonts.plusJakartaSans(
+                                fontSize: 14,
+                                fontWeight: FontWeight.w600,
+                                color: colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                          ),
+                          Icon(
+                            Icons.chevron_right_rounded,
+                            size: 18,
+                            color: colorScheme.onSurfaceVariant,
+                          ),
+                        ],
+                      ),
                     ),
                   ),
-                ),
-                const SizedBox(height: 12),
+                  const SizedBox(height: 12),
+                ],
               ],
             ),
           ),
@@ -1083,7 +1158,9 @@ class _HomeScreenState extends State<HomeScreen>
                 children: [
                   Expanded(
                     child: Text(
-                      '${(_progress * 100).toStringAsFixed(0)}%  —  $_statusMessage',
+                      _isTransferring && _currentReceivingRequest != null
+                          ? '${_formatProgress(_progress, _totalBytesToReceive)}  —  $_statusMessage'
+                          : '${(_progress * 100).toStringAsFixed(0)}%  —  $_statusMessage',
                       style: TextStyle(
                         fontSize: 12,
                         color: Theme.of(context).colorScheme.onSurfaceVariant,
@@ -1310,9 +1387,17 @@ class _HomeScreenState extends State<HomeScreen>
   String _formatSize(int bytes) {
     if (bytes < 1024) return '$bytes B';
     if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
-    if (bytes < 1024 * 1024 * 1024)
+    if (bytes < 1024 * 1024 * 1024) {
       return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
     return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
+  }
+
+  String _formatProgress(double progress, int totalBytes) {
+    final receivedMB = (progress * totalBytes) / (1024 * 1024);
+    final totalMB = totalBytes / (1024 * 1024);
+    final percent = (progress * 100).toStringAsFixed(1);
+    return '${receivedMB.toStringAsFixed(1)} / ${totalMB.toStringAsFixed(1)} MB ($percent%)';
   }
 
   Widget _buildDevicesSection({required bool isMobile}) {
@@ -1483,8 +1568,8 @@ class _HomeScreenState extends State<HomeScreen>
                 ),
               ),
             )
-          : Column(
-              children: const [
+          : const Column(
+              children: [
                 Icon(Icons.devices_other, size: 36, color: Colors.grey),
                 SizedBox(height: 8),
                 Text(

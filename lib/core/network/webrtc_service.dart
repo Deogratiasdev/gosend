@@ -19,12 +19,21 @@ class WebRTCService {
   RTCDataChannel? get dataChannel => _dataChannel;
 
   Function(Uint8List)? onDataReceived;
+  Function(Uint8List, int)? onChunkReceived;
   Function(RTCDataChannelState)? onChannelStateChanged;
   Function(TransferRequest)? onTransferRequestReceived;
   Function(String, bool)? onTransferResponse;
   Function(String, String)? onControlMessage;
   Function(String)? onIceConnectionTypeChanged;
-
+  Function(Map<String, dynamic>)? onRawTextMessage;
+  
+  /// Callback pour router les ACK vers le OptimizedTransferManager actif
+  Function(Map<String, dynamic>)? onAckReceived;
+  
+  /// Callback pour router les messages de contrôle pause/resume/cancel
+  /// vers le bon handler (émetteur ou récepteur)
+  Function(String, String)? onLocalControlMessage;
+  
   final _iceServers = <String, dynamic>{
     'iceServers': [
       {'url': 'stun:stun.l.google.com:19302'},
@@ -133,12 +142,36 @@ class WebRTCService {
 
   void _setupDataChannel() {
     _dataChannel?.onDataChannelState = (state) {
+      debugPrint('📡 DataChannel state: $state');
       onChannelStateChanged?.call(state);
+      
+      // NE PAS fermer le DataChannel quand l'émetteur a fini
+      // Le récepteur doit garder le DataChannel ouvert pour recevoir tous les fichiers
     };
     _dataChannel?.onMessage = (RTCDataChannelMessage message) {
       if (message.isBinary) {
-        onDataReceived?.call(message.binary);
+        debugPrint('📡 Message binaire reçu: ${message.binary.length} bytes');
+        final data = message.binary;
+        if (data.length >= 8) {
+          try {
+            final header = ByteData.sublistView(data, 0, 8);
+            final offset = header.getUint64(0, Endian.big);
+            final payload = data.sublist(8);
+            // Appeler le callback spécialisé pour les chunks (avec offset)
+            if (onChunkReceived != null) {
+              onChunkReceived?.call(payload, offset);
+            } else {
+              onDataReceived?.call(payload);
+            }
+          } catch (e) {
+            debugPrint('Erreur parsing chunk header: $e');
+            onDataReceived?.call(data);
+          }
+        } else {
+          onDataReceived?.call(data);
+        }
       } else {
+        debugPrint('📡 Message texte reçu: ${message.text}');
         _handleTextMessage(message.text);
       }
     };
@@ -149,7 +182,13 @@ class WebRTCService {
       final data = jsonDecode(message);
       final type = data['type'] as String?;
 
-      if (type == 'transfer_request') {
+      // Broadcast the raw parsed JSON to interested listeners
+      onRawTextMessage?.call(data as Map<String, dynamic>);
+
+      if (type == 'ack') {
+        // Router vers le OptimizedTransferManager actif (émetteur)
+        onAckReceived?.call(data as Map<String, dynamic>);
+      } else if (type == 'transfer_request') {
         final request = TransferRequest.fromJson(
           data['payload'] as Map<String, dynamic>,
         );
@@ -162,6 +201,8 @@ class WebRTCService {
         final requestId = data['requestId'] as String;
         final action = data['action'] as String;
         onControlMessage?.call(requestId, action);
+      } else if (type == 'transfer_complete') {
+        debugPrint('✅ Transfert complet reçu');
       }
     } catch (e) {
       debugPrint('Error handling text message: $e');
@@ -194,7 +235,7 @@ class WebRTCService {
 
     final dataChannelDict = RTCDataChannelInit()
       ..ordered = true
-      ..maxRetransmits = 30;
+      ..maxRetransmits = 1000000; // Très élevé pour les gros fichiers
 
     _dataChannel = await _peerConnection!.createDataChannel(
       'fileTransfer',
@@ -236,7 +277,7 @@ class WebRTCService {
       try {
         await completer.future.timeout(const Duration(seconds: 10));
       } on TimeoutException {
-        throw Exception("Délai de connexion dépassé (DataChannel non ouvert)");
+        throw Exception('Délai de connexion dépassé (DataChannel non ouvert)');
       } finally {
         onChannelStateChanged = originalCallback;
       }
@@ -246,6 +287,13 @@ class WebRTCService {
   void sendData(Uint8List data) {
     if (_dataChannel?.state == RTCDataChannelState.RTCDataChannelOpen) {
       _dataChannel?.send(RTCDataChannelMessage.fromBinary(data));
+    }
+  }
+
+  /// Envoie un message JSON textuel sur le DataChannel (ACK, control, etc.)
+  void sendJson(Map<String, dynamic> data) {
+    if (_dataChannel?.state == RTCDataChannelState.RTCDataChannelOpen) {
+      _dataChannel?.send(RTCDataChannelMessage(jsonEncode(data)));
     }
   }
 
@@ -281,8 +329,22 @@ class WebRTCService {
     }
   }
 
+  void sendTransferComplete() {
+    if (_dataChannel?.state == RTCDataChannelState.RTCDataChannelOpen) {
+      final message = jsonEncode({
+        'type': 'transfer_complete',
+      });
+      _dataChannel?.send(RTCDataChannelMessage(message));
+      debugPrint('📤 Message de fin de transfert envoyé');
+    }
+  }
+
   void dispose() {
-    _dataChannel?.close();
+    // Fermer le DataChannel seulement si on est vraiment en train de se déconnecter
+    // Pas pendant un transfert actif
+    if (_dataChannel?.state != RTCDataChannelState.RTCDataChannelOpen) {
+      _dataChannel?.close();
+    }
     _peerConnection?.close();
     _signalingServer?.close();
   }
