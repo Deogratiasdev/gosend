@@ -13,7 +13,7 @@ class OptimizedTransferManager {
 
   int _currentChunkSize = maxChunkSize; // Démarrer directement à la taille maximale de sécurité pour un débit optimal
   int _consecutiveSuccesses = 0;
-  int _consecutiveFailures = 0;
+  int _consecutiveFailures = 0; 
   final int _maxSuccessesBeforeIncrease = 10;
   final int _maxFailuresBeforeDecrease = 3;
 
