@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+
 import 'package:flutter/foundation.dart';
+
 import '../../models/device.dart';
 
 class DiscoveryService {
@@ -17,17 +19,23 @@ class DiscoveryService {
   final Map<String, DateTime> _lastSeenMap = {};
 
   final String localDeviceId;
-  final String localDeviceName;
+  String localDeviceName;
   final String localOs;
+  String localIpAddress;
 
   DiscoveryService({
     required this.localDeviceId,
     required this.localDeviceName,
     required this.localOs,
+    required this.localIpAddress,
   });
 
   Future<void> startDiscovery() async {
     try {
+      _broadcastTimer?.cancel();
+      _cleanupTimer?.cancel();
+      _socket?.close();
+
       _socket = await RawDatagramSocket.bind(
         InternetAddress.anyIPv4,
         broadcastPort,
@@ -54,7 +62,7 @@ class DiscoveryService {
   void _startBroadcasting() {
     _broadcastTimer = Timer.periodic(const Duration(seconds: 2), (timer) {
       if (!isDiscoverable) return;
-      
+
       final message = jsonEncode({
         'id': localDeviceId,
         'name': localDeviceName,
@@ -72,12 +80,18 @@ class DiscoveryService {
     isDiscoverable = !isDiscoverable;
   }
 
+  void updateLocalInfo({required String name, required String ipAddress}) {
+    localDeviceName = name;
+    localIpAddress = ipAddress;
+    _removeLocalEchoes();
+  }
+
   void _handleIncomingDatagram(Datagram datagram) {
     try {
       final message = utf8.decode(datagram.data);
       final data = jsonDecode(message);
 
-      if (data['id'] == localDeviceId) return;
+      if (_isLocalDatagram(data, datagram.address.address)) return;
 
       final device = Device(
         id: data['id'],
@@ -88,8 +102,7 @@ class DiscoveryService {
         httpPort: data['httpPort'] ?? 8081, // NOUVEAU
       );
 
-      // Utiliser IP+nom comme clé unique pour éviter les doublons
-      final uniqueKey = '${device.ip}_${device.name}';
+      final uniqueKey = device.id;
       _devicesMap[uniqueKey] = device;
       _lastSeenMap[uniqueKey] = DateTime.now();
       _updateDiscoveredDevices();
@@ -99,7 +112,32 @@ class DiscoveryService {
   }
 
   void _updateDiscoveredDevices() {
-    discoveredDevices.value = _devicesMap.values.toList();
+    discoveredDevices.value = _devicesMap.values
+        .where((device) => !_isLocalDevice(device))
+        .toList();
+  }
+
+  bool _isLocalDatagram(Map<String, dynamic> data, String senderIp) {
+    if (data['id'] == localDeviceId) return true;
+    if (_isSameIp(senderIp, localIpAddress)) return true;
+    return false;
+  }
+
+  bool _isLocalDevice(Device device) {
+    if (device.id == localDeviceId) return true;
+    if (_isSameIp(device.ip, localIpAddress)) return true;
+    return false;
+  }
+
+  bool _isSameIp(String a, String b) {
+    if (a.isEmpty || b.isEmpty || b == 'Non disponible') return false;
+    return a == b;
+  }
+
+  void _removeLocalEchoes() {
+    _devicesMap.removeWhere((_, device) => _isLocalDevice(device));
+    _lastSeenMap.removeWhere((key, _) => !_devicesMap.containsKey(key));
+    _updateDiscoveredDevices();
   }
 
   void _startCleanupTimer() {

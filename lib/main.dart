@@ -1,15 +1,16 @@
 import 'dart:async';
 import 'dart:io';
-import 'package:flutter/material.dart';
-import 'package:permission_handler/permission_handler.dart';
-import 'package:device_info_plus/device_info_plus.dart';
-import 'package:network_info_plus/network_info_plus.dart';
 
-import 'ui/theme.dart';
-import 'ui/screens/home_screen.dart';
+import 'package:device_info_plus/device_info_plus.dart';
+import 'package:flutter/material.dart';
+import 'package:network_info_plus/network_info_plus.dart';
+import 'package:permission_handler/permission_handler.dart';
+
 import 'core/network/discovery_service.dart';
 import 'core/notifications/notification_service.dart';
 import 'models/device.dart';
+import 'ui/screens/home_screen.dart';
+import 'ui/theme.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -119,6 +120,7 @@ class _GoSendAppState extends State<GoSendApp> {
           _localDeviceName = info.name;
         });
       }
+      _discoveryService.updateLocalInfo(name: info.name, ipAddress: info.ip);
       // Redémarre la découverte avec la nouvelle IP/nom
       _discoveryService.stopDiscovery();
       await _discoveryService.startDiscovery();
@@ -137,6 +139,7 @@ class _GoSendAppState extends State<GoSendApp> {
       localDeviceId: deviceId,
       localDeviceName: info.name,
       localOs: os,
+      localIpAddress: info.ip,
     );
 
     _discoveryService.discoveredDevices.addListener(() {
@@ -180,13 +183,15 @@ class _GoSendAppState extends State<GoSendApp> {
                     _localDeviceName = info.name;
                   });
                 }
+                _discoveryService.updateLocalInfo(
+                  name: info.name,
+                  ipAddress: info.ip,
+                );
                 _discoveryService.stopDiscovery();
                 await _discoveryService.startDiscovery();
               },
             )
-          : const Scaffold(
-              body: Center(child: CircularProgressIndicator()),
-            ),
+          : const Scaffold(body: Center(child: CircularProgressIndicator())),
     );
   }
 }

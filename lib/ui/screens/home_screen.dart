@@ -7,12 +7,12 @@ import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
+
 import '../../core/network/discovery_service.dart';
 import '../../core/network/http_transfer_service.dart';
 import '../../core/notifications/notification_service.dart';
 import '../../models/device.dart';
 import '../../models/transfer_request.dart';
-import 'package:url_launcher/url_launcher.dart';
 
 class HomeScreen extends StatefulWidget {
   final List<Device> devices;
@@ -35,7 +35,7 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen>
-    with SingleTickerProviderStateMixin {
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   Device? _selectedDevice;
   List<File> _selectedFiles = [];
   bool _isDragging = false;
@@ -51,7 +51,6 @@ class _HomeScreenState extends State<HomeScreen>
   TransferRequest? _currentReceivingRequest;
   String? _currentTransferId;
   bool _isPaused = false;
-  bool _isCancelled = false; // Utilisé par le bouton d'annulation
   final TextEditingController _deviceSearchController = TextEditingController();
   String _deviceSearchQuery = '';
   static const platform = MethodChannel('com.example.gosend/share');
@@ -67,11 +66,15 @@ class _HomeScreenState extends State<HomeScreen>
     _pulseAnimation = Tween<double>(begin: 0.85, end: 1.0).animate(
       CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
     );
-    _httpService = HttpTransferService();
-    _httpService.startSignalingServer();
+    _httpService = HttpTransferService(localIpAddress: widget.localIpAddress);
+    _httpService.startServers().catchError((Object e) {
+      debugPrint('Erreur démarrage serveurs HTTP: $e');
+      _showSnack('Erreur ouverture ports 8080/8081 : $e');
+    });
     _httpService.onTransferRequestReceived = _handleTransferRequest;
     _httpService.onTransferResponse = _handleTransferResponse;
     _httpService.onControlMessage = _handleControlMessage;
+    WidgetsBinding.instance.addObserver(this);
     _deviceSearchController.addListener(() {
       setState(
         () => _deviceSearchQuery = _deviceSearchController.text.toLowerCase(),
@@ -81,16 +84,38 @@ class _HomeScreenState extends State<HomeScreen>
     _getReceiveDirectory();
   }
 
+  @override
+  void didUpdateWidget(covariant HomeScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.localIpAddress != widget.localIpAddress) {
+      _httpService.updateLocalIpAddress(widget.localIpAddress);
+    }
+  }
+
+  Future<Directory> _resolveReceiveDirectory() async {
+    if (Platform.isAndroid) {
+      final downloadDir = Directory(
+        '/storage/emulated/0/Download/GoSend/received',
+      );
+      try {
+        await downloadDir.create(recursive: true);
+        return downloadDir;
+      } catch (e) {
+        debugPrint('Impossible d’utiliser Downloads, fallback app dir: $e');
+      }
+    }
+
+    final directory = await getApplicationDocumentsDirectory();
+    final saveDir = Directory('${directory.path}/GoSend/received');
+    await saveDir.create(recursive: true);
+    return saveDir;
+  }
+
   Future<void> _getReceiveDirectory() async {
     try {
-      final directory = await getApplicationDocumentsDirectory();
-      final savePath = '${directory.path}/GoSend/received';
-      final saveDir = Directory(savePath);
-      if (!await saveDir.exists()) {
-        await saveDir.create(recursive: true);
-      }
+      final saveDir = await _resolveReceiveDirectory();
       setState(() {
-        _receiveDirectoryPath = savePath;
+        _receiveDirectoryPath = saveDir.path;
       });
     } catch (e) {
       debugPrint('Error getting receive directory: $e');
@@ -103,13 +128,10 @@ class _HomeScreenState extends State<HomeScreen>
       try {
         if (Platform.isWindows) {
           await Process.run('explorer.exe', [path.replaceAll('/', '\\')]);
+        } else if (Platform.isAndroid) {
+          await platform.invokeMethod('openReceiveDirectory', {'path': path});
         } else {
-          final Uri uri = Uri.file(path);
-          if (await canLaunchUrl(uri)) {
-            await launchUrl(uri);
-          } else {
-            await launchUrl(uri, mode: LaunchMode.externalApplication);
-          }
+          _showSnack('Ouverture du dossier non supportée sur cette plateforme');
         }
       } catch (e) {
         debugPrint('Erreur ouverture dossier: $e');
@@ -148,7 +170,10 @@ class _HomeScreenState extends State<HomeScreen>
           if (files.isNotEmpty) {
             setState(() {
               _selectedFiles = files;
+              _statusMessage = '${files.length} fichier(s) partagé(s) prêt(s)';
             });
+          } else if (mounted) {
+            _showSnack('Aucun fichier partagé valide récupéré');
           }
         }
       } catch (e) {
@@ -159,10 +184,18 @@ class _HomeScreenState extends State<HomeScreen>
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _pulseController.dispose();
     _deviceSearchController.dispose();
     _httpService.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _checkSharedFiles();
+    }
   }
 
   void _handleTransferRequest(TransferRequest request) {
@@ -191,7 +224,6 @@ class _HomeScreenState extends State<HomeScreen>
       setState(() => _isPaused = false);
     } else if (action == 'cancel') {
       setState(() {
-        _isCancelled = true;
         _isTransferring = false;
         _statusMessage = 'Transfert annulé par l\'autre appareil';
         _currentReceivingRequest = null;
@@ -238,26 +270,28 @@ class _HomeScreenState extends State<HomeScreen>
 
               // Calculer le total en octets
               int totalSize = 0;
-              for (final f in request.files) totalSize += f.size;
+              for (final f in request.files) {
+                totalSize += f.size;
+              }
 
               // Préparer le répertoire de sauvegarde
-              final directory = await getApplicationDocumentsDirectory();
-              final saveDir = '${directory.path}/GoSend/received';
-              await Directory(saveDir).create(recursive: true);
+              final saveDirectory = await _resolveReceiveDirectory();
+              final saveDir = saveDirectory.path;
+              _receiveDirectoryPath = saveDir;
 
-              // Démarrer le serveur de réception HTTP
-              await _httpService.startTransferServer(
+              // Préparer la réception (le serveur HTTP est déjà en écoute)
+              _httpService.prepareReceive(
                 request.id,
                 request.files,
                 saveDir,
                 (fileIndex, received, total) {
                   setState(() {
                     _currentReceivingRequest = request;
-                    _totalBytesToReceive = totalSize;
+                    _totalBytesToReceive = total;
                     _isTransferring = true;
-                    final globalReceived = received;
-                    _progress = totalSize > 0 ? globalReceived / totalSize : 0.0;
-                    _statusMessage = 'Réception : ${request.files[fileIndex].name}';
+                    _progress = total > 0 ? received / total : 0.0;
+                    _statusMessage =
+                        'Réception : ${request.files[fileIndex].name}';
                   });
                 },
                 (fileIndex, filePath) {
@@ -286,7 +320,6 @@ class _HomeScreenState extends State<HomeScreen>
                 _incomingRequests.remove(request);
                 _currentReceivingRequest = request;
                 _totalBytesToReceive = totalSize;
-                _isCancelled = false;
                 _isPaused = false;
                 _isTransferring = true;
                 _statusMessage = 'Réception en cours...';
@@ -301,7 +334,7 @@ class _HomeScreenState extends State<HomeScreen>
 
   Future<void> _pickFiles() async {
     final bool isMobile = MediaQuery.of(context).size.width <= 800;
-    
+
     if ((isMobile && Platform.isAndroid) || Platform.isIOS) {
       final choice = await showModalBottomSheet<String>(
         context: context,
@@ -337,9 +370,7 @@ class _HomeScreenState extends State<HomeScreen>
         final pickedFiles = await picker.pickMultiImage();
         if (pickedFiles.isNotEmpty) {
           setState(() {
-            _selectedFiles.addAll(
-              pickedFiles.map((x) => File(x.path)),
-            );
+            _selectedFiles.addAll(pickedFiles.map((x) => File(x.path)));
           });
         }
       } else if (choice == 'videos') {
@@ -435,7 +466,6 @@ class _HomeScreenState extends State<HomeScreen>
   Future<void> _startFileTransfer() async {
     setState(() {
       _isTransferring = true;
-      _isCancelled = false;
       _isPaused = false;
       _statusMessage = 'Envoi en cours...';
     });
@@ -1044,7 +1074,6 @@ class _HomeScreenState extends State<HomeScreen>
                             );
                           }
                           setState(() {
-                            _isCancelled = true;
                             _isTransferring = false;
                             _statusMessage = 'Annulé';
                           });

@@ -1,7 +1,8 @@
-import 'package:sqflite/sqflite.dart';
-import 'package:path/path.dart';
 import 'dart:io';
+
+import 'package:path/path.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
+
 import '../../models/history_item.dart';
 
 class HistoryDB {
@@ -58,7 +59,7 @@ CREATE TABLE transfers (
 
   Future<List<HistoryItem>> getAllItems() async {
     final db = await instance.database;
-    final orderBy = 'timestamp DESC';
+    const orderBy = 'timestamp DESC';
     final result = await db.query('transfers', orderBy: orderBy);
     return result.map((json) => HistoryItem.fromMap(json)).toList();
   }
