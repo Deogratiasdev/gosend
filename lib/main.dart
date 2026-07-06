@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:network_info_plus/network_info_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:window_manager/window_manager.dart';
 
 import 'core/network/discovery_service.dart';
 import 'core/notifications/notification_service.dart';
@@ -16,6 +17,28 @@ import 'ui/theme.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Configure window for desktop platforms
+  if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) {
+    await windowManager.ensureInitialized();
+
+    WindowOptions windowOptions = const WindowOptions(
+      size: Size(1100, 720),
+      minimumSize: Size(800, 550),
+      center: true,
+      backgroundColor: Colors.transparent,
+      skipTaskbar: false,
+      titleBarStyle: TitleBarStyle.hidden,
+      title: 'GoSend',
+    );
+
+    await windowManager.waitUntilReadyToShow(windowOptions, () async {
+      await windowManager.show();
+      await windowManager.focus();
+      await windowManager.setBackgroundColor(Colors.transparent);
+    });
+  }
+
   runApp(const GoSendApp());
 }
 
@@ -197,7 +220,9 @@ class _GoSendAppState extends State<GoSendApp> {
                       await _discoveryService.startDiscovery();
                     },
                   )
-                : const Scaffold(body: Center(child: CircularProgressIndicator())),
+                : const Scaffold(
+                    body: Center(child: CircularProgressIndicator()),
+                  ),
           );
         },
       ),

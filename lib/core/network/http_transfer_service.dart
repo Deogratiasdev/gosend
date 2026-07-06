@@ -25,7 +25,11 @@ class HttpTransferService {
   String? _currentSaveDir;
   int _completedReceiveBytes = 0;
   final Set<int> _completedFileIndexes = <int>{};
+  final Map<int, int> _fileReceivedBytes = <int, int>{};
+  bool _isPaused = false;
+  bool _isCancelled = false;
   Function(int, int, int)? _onProgress;
+  Function(int, int, int)? _onFileProgress;
   Function(int, String)? _onFileComplete;
   Function()? _onAllComplete;
 
@@ -36,17 +40,14 @@ class HttpTransferService {
   Function(String)? onStatusUpdate;
 
   HttpTransferService({String? localIpAddress})
-      : _localIpAddress = localIpAddress;
+    : _localIpAddress = localIpAddress;
 
   void updateLocalIpAddress(String localIpAddress) {
     _localIpAddress = localIpAddress;
   }
 
   Future<void> startServers() async {
-    await Future.wait([
-      _startSignalingServer(),
-      _startTransferServer(),
-    ]);
+    await Future.wait([_startSignalingServer(), _startTransferServer()]);
     debugPrint(
       '✅ Serveurs HTTP démarrés (signalisation: $signalingPort, transfert: $transferPort)',
     );
@@ -83,6 +84,7 @@ class HttpTransferService {
     List<FileInfo> files,
     String saveDir,
     Function(int fileIndex, int received, int total) onProgress,
+    Function(int fileIndex, int fileReceived, int fileSize) onFileProgress,
     Function(int fileIndex, String filePath) onFileComplete,
     Function() onAllComplete,
   ) {
@@ -90,15 +92,16 @@ class HttpTransferService {
     _currentSaveDir = saveDir;
     _completedReceiveBytes = 0;
     _completedFileIndexes.clear();
+    _fileReceivedBytes.clear();
+    _isPaused = false;
+    _isCancelled = false;
     _onProgress = onProgress;
+    _onFileProgress = onFileProgress;
     _onFileComplete = onFileComplete;
     _onAllComplete = onAllComplete;
   }
 
-  Future<Response> _handleFileUpload(
-    Request request,
-    int fileIndex,
-  ) async {
+  Future<Response> _handleFileUpload(Request request, int fileIndex) async {
     if (_currentFiles == null ||
         _currentSaveDir == null ||
         fileIndex < 0 ||
@@ -115,12 +118,26 @@ class HttpTransferService {
     final sink = file.openWrite();
     int received = 0;
     final total = _currentFiles!.fold<int>(0, (sum, file) => sum + file.size);
+    _fileReceivedBytes[fileIndex] = 0;
 
     try {
       await for (final chunk in request.read()) {
+        if (_isCancelled) {
+          await sink.close();
+          return Response(499, body: 'Transfer cancelled');
+        }
+        while (_isPaused) {
+          await Future.delayed(const Duration(milliseconds: 100));
+          if (_isCancelled) {
+            await sink.close();
+            return Response(499, body: 'Transfer cancelled');
+          }
+        }
         sink.add(chunk);
         received += chunk.length;
+        _fileReceivedBytes[fileIndex] = received;
         _onProgress?.call(fileIndex, _completedReceiveBytes + received, total);
+        _onFileProgress?.call(fileIndex, received, fileInfo.size);
       }
       await sink.flush();
       await sink.close();
@@ -169,14 +186,20 @@ class HttpTransferService {
   Future<Response> _handleTransferResponse(Request request) async {
     final body = await request.readAsString();
     final data = jsonDecode(body) as Map<String, dynamic>;
-    onTransferResponse?.call(data['requestId'] as String, data['accepted'] as bool);
+    onTransferResponse?.call(
+      data['requestId'] as String,
+      data['accepted'] as bool,
+    );
     return Response.ok('OK');
   }
 
   Future<Response> _handleControl(Request request) async {
     final body = await request.readAsString();
     final data = jsonDecode(body) as Map<String, dynamic>;
-    onControlMessage?.call(data['requestId'] as String, data['action'] as String);
+    onControlMessage?.call(
+      data['requestId'] as String,
+      data['action'] as String,
+    );
     return Response.ok('OK');
   }
 
@@ -191,16 +214,18 @@ class HttpTransferService {
     if (peerIp == null) return;
 
     final uri = Uri.parse('http://$peerIp:$signalingPort/transfer-request');
-    final response = await http.post(
-      uri,
-      headers: {'content-type': 'application/json'},
-      body: jsonEncode({
-        'type': 'transfer_request',
-        'payload': request.toJson(),
-        'senderIp': _localIpAddress,
-        'senderHttpPort': transferPort,
-      }),
-    ).timeout(const Duration(seconds: 10));
+    final response = await http
+        .post(
+          uri,
+          headers: {'content-type': 'application/json'},
+          body: jsonEncode({
+            'type': 'transfer_request',
+            'payload': request.toJson(),
+            'senderIp': _localIpAddress,
+            'senderHttpPort': transferPort,
+          }),
+        )
+        .timeout(const Duration(seconds: 10));
 
     _throwForBadStatus(response.statusCode, uri, 'Demande non envoyée');
   }
@@ -213,11 +238,13 @@ class HttpTransferService {
     }
 
     final uri = Uri.parse('http://$peerIp:$signalingPort/transfer-response');
-    final response = await http.post(
-      uri,
-      headers: {'content-type': 'application/json'},
-      body: jsonEncode({'requestId': requestId, 'accepted': accepted}),
-    ).timeout(const Duration(seconds: 5));
+    final response = await http
+        .post(
+          uri,
+          headers: {'content-type': 'application/json'},
+          body: jsonEncode({'requestId': requestId, 'accepted': accepted}),
+        )
+        .timeout(const Duration(seconds: 5));
 
     _throwForBadStatus(response.statusCode, uri, 'Réponse non envoyée');
   }
@@ -227,13 +254,31 @@ class HttpTransferService {
     if (peerIp == null) return;
 
     final uri = Uri.parse('http://$peerIp:$signalingPort/control');
-    final response = await http.post(
-      uri,
-      headers: {'content-type': 'application/json'},
-      body: jsonEncode({'requestId': requestId, 'action': action}),
-    ).timeout(const Duration(seconds: 5));
+    final response = await http
+        .post(
+          uri,
+          headers: {'content-type': 'application/json'},
+          body: jsonEncode({'requestId': requestId, 'action': action}),
+        )
+        .timeout(const Duration(seconds: 5));
 
-    _throwForBadStatus(response.statusCode, uri, 'Message de contrôle non envoyé');
+    _throwForBadStatus(
+      response.statusCode,
+      uri,
+      'Message de contrôle non envoyé',
+    );
+  }
+
+  void pauseTransfer() {
+    _isPaused = true;
+  }
+
+  void resumeTransfer() {
+    _isPaused = false;
+  }
+
+  void cancelTransfer() {
+    _isCancelled = true;
   }
 
   Future<void> sendFiles(
@@ -285,7 +330,10 @@ class HttpTransferService {
       final client = http.Client();
       try {
         final responseFuture = client.send(streamedRequest);
-        final results = await Future.wait<dynamic>([sendFuture, responseFuture]);
+        final results = await Future.wait<dynamic>([
+          sendFuture,
+          responseFuture,
+        ]);
         final response = results[1] as http.StreamedResponse;
         if (response.statusCode < 200 || response.statusCode >= 300) {
           final body = await response.stream.bytesToString();

@@ -12,9 +12,10 @@ import 'package:provider/provider.dart';
 import '../../core/network/discovery_service.dart';
 import '../../core/network/http_transfer_service.dart';
 import '../../core/notifications/notification_service.dart';
+import '../../core/theme/theme_service.dart';
 import '../../models/device.dart';
 import '../../models/transfer_request.dart';
-import '../../core/theme/theme_service.dart';
+import '../widgets/custom_title_bar.dart';
 
 class HomeScreen extends StatefulWidget {
   final List<Device> devices;
@@ -46,6 +47,7 @@ class _HomeScreenState extends State<HomeScreen>
   double _progress = 0.0;
   int _totalBytesToReceive = 0;
   String _statusMessage = 'Prêt à envoyer';
+  final Map<int, double> _fileProgress = <int, double>{};
   late AnimationController _pulseController;
   late Animation<double> _pulseAnimation;
   late final HttpTransferService _httpService;
@@ -103,10 +105,9 @@ class _HomeScreenState extends State<HomeScreen>
         await downloadDir.create(recursive: true);
         return downloadDir;
       } catch (e) {
-        debugPrint('Impossible d’utiliser Downloads, fallback app dir: $e');
+        debugPrint('Impossible d\'utiliser Downloads, fallback app dir: $e');
       }
     }
-
     final directory = await getApplicationDocumentsDirectory();
     final saveDir = Directory('${directory.path}/GoSend/received');
     await saveDir.create(recursive: true);
@@ -116,9 +117,7 @@ class _HomeScreenState extends State<HomeScreen>
   Future<void> _getReceiveDirectory() async {
     try {
       final saveDir = await _resolveReceiveDirectory();
-      setState(() {
-        _receiveDirectoryPath = saveDir.path;
-      });
+      setState(() => _receiveDirectoryPath = saveDir.path);
     } catch (e) {
       debugPrint('Error getting receive directory: $e');
     }
@@ -126,6 +125,28 @@ class _HomeScreenState extends State<HomeScreen>
 
   Future<void> _openReceiveDirectory() async {
     if (_receiveDirectoryPath != null) {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Ouvrir le dossier de réception'),
+          content: const Text(
+            'Vous allez être redirigé vers le dossier où les fichiers reçus sont enregistrés.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Annuler'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Ouvrir'),
+            ),
+          ],
+        ),
+      );
+
+      if (confirmed != true) return;
+
       final path = _receiveDirectoryPath!;
       try {
         if (Platform.isWindows) {
@@ -150,37 +171,26 @@ class _HomeScreenState extends State<HomeScreen>
         );
         if (sharedFiles != null && sharedFiles.isNotEmpty) {
           final List<File> files = [];
-
           for (final item in sharedFiles) {
             try {
-              // The Android native code returns file system paths for shared items
-              // (it copies content:// URIs to cache files). Accept strings directly.
               if (item is String) {
                 var path = item;
-                if (path.startsWith('file://')) {
+                if (path.startsWith('file://'))
                   path = path.replaceFirst('file://', '');
-                }
                 final file = File(path);
                 if (await file.exists()) {
                   files.add(file);
-                } else {
-                  debugPrint('Shared file path not found: $path');
                 }
-              } else {
-                debugPrint('Unsupported shared item type: ${item.runtimeType}');
               }
             } catch (e) {
               debugPrint('Erreur traitement shared item $item: $e');
             }
           }
-
           if (files.isNotEmpty) {
             setState(() {
               _selectedFiles = files;
               _statusMessage = '${files.length} fichier(s) partagé(s) prêt(s)';
             });
-          } else if (mounted) {
-            _showSnack('Aucun fichier partagé valide récupéré');
           }
         }
       } catch (e) {
@@ -200,15 +210,11 @@ class _HomeScreenState extends State<HomeScreen>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) {
-      _checkSharedFiles();
-    }
+    if (state == AppLifecycleState.resumed) _checkSharedFiles();
   }
 
   void _handleTransferRequest(TransferRequest request) {
-    setState(() {
-      _incomingRequests.add(request);
-    });
+    setState(() => _incomingRequests.add(request));
     _showTransferRequestDialog(request);
   }
 
@@ -227,34 +233,86 @@ class _HomeScreenState extends State<HomeScreen>
   void _handleControlMessage(String requestId, String action) {
     if (action == 'pause') {
       setState(() => _isPaused = true);
+      _httpService.pauseTransfer();
     } else if (action == 'resume') {
       setState(() => _isPaused = false);
+      _httpService.resumeTransfer();
     } else if (action == 'cancel') {
       setState(() {
         _isTransferring = false;
         _statusMessage = 'Transfert annulé par l\'autre appareil';
         _currentReceivingRequest = null;
       });
+      _httpService.cancelTransfer();
+    }
+  }
+
+  void _pauseTransfer() {
+    setState(() => _isPaused = true);
+    _httpService.pauseTransfer();
+    if (_currentTransferId != null) {
+      _httpService.sendControlMessage(_currentTransferId!, 'pause');
+    }
+  }
+
+  void _resumeTransfer() {
+    setState(() => _isPaused = false);
+    _httpService.resumeTransfer();
+    if (_currentTransferId != null) {
+      _httpService.sendControlMessage(_currentTransferId!, 'resume');
+    }
+  }
+
+  void _cancelTransfer() {
+    setState(() {
+      _isTransferring = false;
+      _statusMessage = 'Transfert annulé';
+      _currentReceivingRequest = null;
+    });
+    _httpService.cancelTransfer();
+    if (_currentTransferId != null) {
+      _httpService.sendControlMessage(_currentTransferId!, 'cancel');
     }
   }
 
   void _showTransferRequestDialog(TransferRequest request) {
+    final colorScheme = Theme.of(context).colorScheme;
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Demande de transfert'),
+        title: Text(
+          'Demande de transfert',
+          style: GoogleFonts.plusJakartaSans(fontWeight: FontWeight.w700),
+        ),
         content: SingleChildScrollView(
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text('De: ${request.senderName}'),
-              const SizedBox(height: 8),
-              const Text('Fichiers:'),
+              Row(
+                children: [
+                  Icon(
+                    Icons.person,
+                    size: 16,
+                    color: colorScheme.onSurfaceVariant,
+                  ),
+                  const SizedBox(width: 6),
+                  Text('De: ${request.senderName}'),
+                ],
+              ),
+              const SizedBox(height: 12),
+              Text(
+                'Fichiers:',
+                style: GoogleFonts.plusJakartaSans(fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 6),
               ...request.files.map(
                 (file) => Padding(
                   padding: const EdgeInsets.only(left: 16, top: 4),
-                  child: Text('• ${file.name} (${_formatSize(file.size)})'),
+                  child: Text(
+                    '• ${file.name} (${_formatSize(file.size)})',
+                    style: TextStyle(color: colorScheme.onSurfaceVariant),
+                  ),
                 ),
               ),
             ],
@@ -265,28 +323,23 @@ class _HomeScreenState extends State<HomeScreen>
             onPressed: () {
               Navigator.pop(context);
               _httpService.sendTransferResponse(request.id, false);
-              setState(() {
-                _incomingRequests.remove(request);
-              });
+              setState(() => _incomingRequests.remove(request));
             },
-            child: const Text('Refuser'),
+            child: Text(
+              'Refuser',
+              style: TextStyle(color: colorScheme.onSurfaceVariant),
+            ),
           ),
-          TextButton(
+          FilledButton(
             onPressed: () async {
               Navigator.pop(context);
-
-              // Calculer le total en octets
               int totalSize = 0;
               for (final f in request.files) {
                 totalSize += f.size;
               }
-
-              // Préparer le répertoire de sauvegarde
               final saveDirectory = await _resolveReceiveDirectory();
               final saveDir = saveDirectory.path;
               _receiveDirectoryPath = saveDir;
-
-              // Préparer la réception (le serveur HTTP est déjà en écoute)
               _httpService.prepareReceive(
                 request.id,
                 request.files,
@@ -301,28 +354,31 @@ class _HomeScreenState extends State<HomeScreen>
                         'Réception : ${request.files[fileIndex].name}';
                   });
                 },
+                (fileIndex, fileReceived, fileSize) {
+                  setState(() {
+                    _fileProgress[fileIndex] = fileSize > 0
+                        ? fileReceived / fileSize
+                        : 0.0;
+                  });
+                },
                 (fileIndex, filePath) {
-                  debugPrint('✅ Fichier reçu: $filePath');
+                  debugPrint('Fichier reçu: $filePath');
                 },
                 () {
                   setState(() {
                     _isTransferring = false;
                     _progress = 0.0;
-                    _statusMessage = '✅ Transfert terminé !';
+                    _statusMessage = 'Transfert terminé !';
                     _currentReceivingRequest = null;
                   });
-                  _showSnack('✅ Tous les fichiers enregistrés !');
-
+                  _showSnack('Tous les fichiers enregistrés !');
                   NotificationService().showNotification(
                     title: 'Transfert terminé',
                     body: '${request.files.length} fichier(s) reçu(s)',
                   );
                 },
               );
-
-              // Accepter le transfert (l'émetteur va commencer l'envoi)
               await _httpService.sendTransferResponse(request.id, true);
-
               setState(() {
                 _incomingRequests.remove(request);
                 _currentReceivingRequest = request;
@@ -341,7 +397,6 @@ class _HomeScreenState extends State<HomeScreen>
 
   Future<void> _pickFiles() async {
     final bool isMobile = MediaQuery.of(context).size.width <= 800;
-
     if ((isMobile && Platform.isAndroid) || Platform.isIOS) {
       final choice = await showModalBottomSheet<String>(
         context: context,
@@ -371,74 +426,64 @@ class _HomeScreenState extends State<HomeScreen>
           ),
         ),
       );
-
       if (choice == 'photos') {
         final picker = ImagePicker();
         final pickedFiles = await picker.pickMultiImage();
         if (pickedFiles.isNotEmpty) {
-          setState(() {
-            _selectedFiles.addAll(pickedFiles.map((x) => File(x.path)));
-          });
+          setState(
+            () => _selectedFiles.addAll(pickedFiles.map((x) => File(x.path))),
+          );
         }
       } else if (choice == 'videos') {
         final picker = ImagePicker();
         final pickedFile = await picker.pickVideo(source: ImageSource.gallery);
         if (pickedFile != null) {
-          setState(() {
-            _selectedFiles.add(File(pickedFile.path));
-          });
+          setState(() => _selectedFiles.add(File(pickedFile.path)));
         }
       } else if (choice == 'files') {
         final result = await FilePicker.platform.pickFiles(allowMultiple: true);
         if (result != null) {
-          setState(() {
-            _selectedFiles = result.paths
-                .whereType<String>()
-                .map(File.new)
-                .toList();
-          });
+          setState(
+            () => _selectedFiles.addAll(
+              result.paths.whereType<String>().map(File.new),
+            ),
+          );
         }
       }
     } else {
       final result = await FilePicker.platform.pickFiles(allowMultiple: true);
       if (result != null) {
-        setState(() {
-          _selectedFiles = result.paths
-              .whereType<String>()
-              .map(File.new)
-              .toList();
-        });
+        setState(
+          () => _selectedFiles.addAll(
+            result.paths.whereType<String>().map(File.new),
+          ),
+        );
       }
     }
   }
 
   Future<void> _sendFiles() async {
     if (_selectedDevice == null) {
-      _showSnack('⚠️ Sélectionne d\'abord un appareil dans la liste');
+      _showSnack('Sélectionne d\'abord un appareil dans la liste');
       return;
     }
     if (_selectedFiles.isEmpty) {
-      _showSnack('⚠️ Sélectionne d\'abord des fichiers à envoyer');
+      _showSnack('Sélectionne d\'abord des fichiers à envoyer');
       return;
     }
-
     setState(() {
       _isConnecting = true;
       _statusMessage = 'Connexion à ${_selectedDevice!.name}...';
     });
-
     try {
-      // PAS de handshake WebRTC nécessaire, juste configurer l'IP
       _httpService.connectToPeer(
         _selectedDevice!.ip,
         httpPort: _selectedDevice!.httpPort,
       );
-
       setState(() {
         _isConnecting = false;
         _statusMessage = 'En attente d\'acceptation...';
       });
-
       final filesInfo = await Future.wait(
         _selectedFiles.map((file) async {
           final size = await file.length();
@@ -449,7 +494,6 @@ class _HomeScreenState extends State<HomeScreen>
           );
         }),
       );
-
       final request = TransferRequest(
         id: DateTime.now().millisecondsSinceEpoch.toString(),
         senderId: 'local',
@@ -457,8 +501,6 @@ class _HomeScreenState extends State<HomeScreen>
         files: filesInfo,
         timestamp: DateTime.now(),
       );
-
-      // Envoyer la demande (le transfert démarrera après acceptation)
       await _httpService.sendTransferRequest(request);
       _currentTransferId = request.id;
     } catch (e) {
@@ -466,7 +508,7 @@ class _HomeScreenState extends State<HomeScreen>
         _isConnecting = false;
         _statusMessage = 'Erreur de connexion';
       });
-      _showSnack('❌ Erreur: $e');
+      _showSnack('Erreur: $e');
     }
   }
 
@@ -476,7 +518,6 @@ class _HomeScreenState extends State<HomeScreen>
       _isPaused = false;
       _statusMessage = 'Envoi en cours...';
     });
-
     try {
       await _httpService.sendFiles(
         _selectedFiles,
@@ -491,20 +532,19 @@ class _HomeScreenState extends State<HomeScreen>
           setState(() {
             _isTransferring = false;
             _progress = 1.0;
-            _statusMessage = '✅ Envoi terminé !';
-            _selectedFiles = [];
+            _statusMessage = 'Envoi terminé !';
             _currentTransferId = null;
           });
-          _showSnack('✅ Fichiers envoyés avec succès !');
+          _showSnack('Fichiers envoyés avec succès !');
         },
       );
     } catch (e) {
       setState(() {
         _isConnecting = false;
         _isTransferring = false;
-        _statusMessage = '❌ Erreur : $e';
+        _statusMessage = 'Erreur : $e';
       });
-      _showSnack('❌ Erreur de transfert');
+      _showSnack('Erreur de transfert');
     }
   }
 
@@ -531,19 +571,26 @@ class _HomeScreenState extends State<HomeScreen>
                   vertical: 12,
                 ),
                 decoration: BoxDecoration(
-                  color: Colors.grey.shade800,
-                  borderRadius: BorderRadius.circular(8),
+                  color: Theme.of(context).brightness == Brightness.dark
+                      ? const Color(0xFFE8E7E5)
+                      : const Color(0xFF2A2A2A),
+                  borderRadius: BorderRadius.circular(10),
                   boxShadow: const [
                     BoxShadow(
-                      color: Colors.black26,
-                      blurRadius: 4,
+                      color: Colors.black12,
+                      blurRadius: 8,
                       offset: Offset(0, 2),
                     ),
                   ],
                 ),
                 child: Text(
                   msg,
-                  style: const TextStyle(color: Colors.white, fontSize: 14),
+                  style: TextStyle(
+                    color: Theme.of(context).brightness == Brightness.dark
+                        ? const Color(0xFF141414)
+                        : Colors.white,
+                    fontSize: 14,
+                  ),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),
@@ -572,31 +619,32 @@ class _HomeScreenState extends State<HomeScreen>
     );
   }
 
-  // ─────────────────────── MOBILE ───────────────────────
+  // ─────────────── MOBILE ───────────────
 
   Widget _buildMobileLayout() {
     final colorScheme = Theme.of(context).colorScheme;
     final isLight = Theme.of(context).brightness == Brightness.light;
     return AnnotatedRegion<SystemUiOverlayStyle>(
       value: SystemUiOverlayStyle(
-        statusBarColor: isLight ? Colors.white : const Color(0xFF0F0F0F),
-        statusBarIconBrightness: isLight
+        statusBarColor: isLight
+            ? const Color(0xFFFAF9F7)
+            : const Color(0xFF141414),
+        statusBarIconBrightness: isLight ? Brightness.dark : Brightness.light,
+        systemNavigationBarColor: colorScheme.surface,
+        systemNavigationBarIconBrightness: isLight
             ? Brightness.dark
             : Brightness.light,
-        systemNavigationBarColor: colorScheme.surface,
-        systemNavigationBarIconBrightness:
-            isLight
-                ? Brightness.dark
-                : Brightness.light,
       ),
       child: Scaffold(
-        backgroundColor: colorScheme.surface,
+        backgroundColor: colorScheme.surfaceContainerLow,
         appBar: AppBar(
-          backgroundColor: isLight ? Colors.white : const Color(0xFF0F0F0F),
+          backgroundColor: isLight
+              ? const Color(0xFFFAF9F7)
+              : const Color(0xFF141414),
           title: Text(
             'GoSend',
             style: GoogleFonts.plusJakartaSans(
-              fontWeight: FontWeight.w700,
+              fontWeight: FontWeight.w800,
               fontSize: 22,
             ),
           ),
@@ -609,8 +657,8 @@ class _HomeScreenState extends State<HomeScreen>
                   icon: Icon(
                     Icons.wifi_tethering,
                     color: widget.devices.isNotEmpty
-                        ? Colors.green
-                        : Colors.orange,
+                        ? colorScheme.onSurface
+                        : colorScheme.onSurfaceVariant,
                   ),
                   onPressed: widget.onRefresh,
                   tooltip: 'Rafraîchir la découverte',
@@ -625,57 +673,15 @@ class _HomeScreenState extends State<HomeScreen>
             IconButton(
               icon: const Icon(Icons.brightness_medium),
               tooltip: 'Thème',
-              onPressed: () {
-                showDialog(
-                  context: context,
-                  builder: (context) => AlertDialog(
-                    title: const Text('Choisir un thème'),
-                    content: SizedBox(
-                      width: 300,
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          _buildThemeOption(
-                            context,
-                            AppThemeMode.system,
-                            'Système',
-                            'Utilise le thème du système',
-                            Icons.brightness_auto,
-                          ),
-                          _buildThemeOption(
-                            context,
-                            AppThemeMode.light,
-                            'Clair',
-                            'Thème clair',
-                            Icons.wb_sunny,
-                          ),
-                          _buildThemeOption(
-                            context,
-                            AppThemeMode.dark,
-                            'Sombre',
-                            'Thème sombre',
-                            Icons.nightlight_round,
-                          ),
-                        ],
-                      ),
-                    ),
-                    actions: [
-                      TextButton(
-                        onPressed: () => Navigator.pop(context),
-                        child: const Text('Annuler'),
-                      ),
-                    ],
-                  ),
-                );
-              },
+              onPressed: () => _showThemeDialog(context),
             ),
             PopupMenuButton<String>(
               icon: const Icon(Icons.more_vert),
               onSelected: (value) {
                 if (value == 'invisible') {
-                  setState(() {
-                    widget.discoveryService.toggleDiscoverability();
-                  });
+                  setState(
+                    () => widget.discoveryService.toggleDiscoverability(),
+                  );
                 }
               },
               itemBuilder: (BuildContext context) => [
@@ -720,260 +726,204 @@ class _HomeScreenState extends State<HomeScreen>
     );
   }
 
-  // ─────────────────────── DESKTOP ───────────────────────
+  // ─────────────── DESKTOP ───────────────
 
   Widget _buildDesktopLayout() {
     final colorScheme = Theme.of(context).colorScheme;
+
     return Scaffold(
       body: Row(
         children: [
-          // Sidebar gauche : appareils
+          // ── Sidebar ──
           Container(
-            width: 280,
+            width: 300,
             decoration: BoxDecoration(
               color: colorScheme.surface,
-              borderRadius: const BorderRadius.only(
-                topRight: Radius.circular(20),
-                bottomRight: Radius.circular(20),
-              ),
               border: Border(
-                right: BorderSide(
-                  color: colorScheme.outlineVariant.withAlpha(60),
-                ),
+                right: BorderSide(color: colorScheme.outlineVariant),
               ),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withAlpha(12),
-                  blurRadius: 16,
-                  offset: const Offset(4, 0),
-                ),
-              ],
             ),
             child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const SizedBox(height: 32),
+                // Logo / Brand
                 Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 20),
-                  child: Text(
-                    'GoSend',
-                    style: GoogleFonts.plusJakartaSans(
-                      fontSize: 26,
-                      fontWeight: FontWeight.w800,
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 4),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 20),
-                  child: Text(
-                    widget.localDeviceName,
-                    style: TextStyle(
-                      color: colorScheme.onSurfaceVariant,
-                      fontSize: 13,
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 24),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 20),
+                  padding: const EdgeInsets.symmetric(horizontal: 24),
                   child: Row(
                     children: [
+                      Text(
+                        'GoSend',
+                        style: GoogleFonts.plusJakartaSans(
+                          fontSize: 24,
+                          fontWeight: FontWeight.w800,
+                          color: colorScheme.onSurface,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 24),
+                  child: Row(
+                    children: [
+                      const SizedBox(width: 54),
                       AnimatedBuilder(
                         animation: _pulseAnimation,
                         builder: (_, __) => Transform.scale(
                           scale: _pulseAnimation.value,
                           child: Container(
-                            width: 8,
-                            height: 8,
+                            width: 7,
+                            height: 7,
                             decoration: BoxDecoration(
-                              color: widget.devices.isNotEmpty
-                                  ? Colors.green
-                                  : Colors.orange,
                               shape: BoxShape.circle,
+                              color: colorScheme.onSurface,
                             ),
                           ),
                         ),
                       ),
                       const SizedBox(width: 8),
-                      Text(
-                        widget.devices.isNotEmpty
-                            ? '${widget.devices.length} appareil(s) trouvé(s)'
-                            : 'Recherche...',
-                        style: TextStyle(
-                          color: colorScheme.onSurfaceVariant,
-                          fontSize: 12,
+                      Expanded(
+                        child: Text(
+                          widget.localDeviceName,
+                          style: TextStyle(
+                            color: colorScheme.onSurfaceVariant,
+                            fontSize: 12,
+                          ),
+                          overflow: TextOverflow.ellipsis,
                         ),
-                      ),
-                      const Spacer(),
-                      IconButton(
-                        icon: Icon(
-                          widget.discoveryService.isDiscoverable
-                              ? Icons.visibility
-                              : Icons.visibility_off,
-                          size: 18,
-                        ),
-                        onPressed: () => setState(
-                          () => widget.discoveryService.toggleDiscoverability(),
-                        ),
-                        tooltip: 'Visibilité',
-                      ),
-                      IconButton(
-                        icon: const Icon(Icons.refresh, size: 18),
-                        onPressed: widget.onRefresh,
-                        tooltip: 'Rafraîchir',
                       ),
                     ],
                   ),
                 ),
-                const SizedBox(height: 12),
-                Expanded(child: _buildDevicesSection(isMobile: false)),
-                if (_receiveDirectoryPath != null) ...[
-                  const Divider(height: 1),
-                  InkWell(
-                    borderRadius: const BorderRadius.only(
-                      bottomRight: Radius.circular(20),
-                    ),
-                    onTap: _openReceiveDirectory,
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 20,
-                        vertical: 16,
-                      ),
-                      child: Row(
-                        children: [
-                          Icon(
-                            Icons.folder_open_rounded,
-                            size: 20,
-                            color: colorScheme.onSurfaceVariant,
-                          ),
-                          const SizedBox(width: 12),
-                          Expanded(
-                            child: Text(
-                              'Dossier de réception',
-                              style: GoogleFonts.plusJakartaSans(
-                                fontSize: 14,
-                                fontWeight: FontWeight.w600,
-                                color: colorScheme.onSurfaceVariant,
-                              ),
-                            ),
-                          ),
-                          Icon(
-                            Icons.chevron_right_rounded,
-                            size: 18,
-                            color: colorScheme.onSurfaceVariant,
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ],
-  const Divider(height: 1),
-                InkWell(
-                  borderRadius: const BorderRadius.only(
-                    bottomRight: Radius.circular(20),
-                  ),
-                  onTap: () {
-                    showDialog(
-                      context: context,
-                      builder: (context) => AlertDialog(
-                        title: const Text('Choisir un thème'),
-                        content: SizedBox(
-                          width: 300,
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              _buildThemeOption(
-                                context,
-                                AppThemeMode.system,
-                                'Système',
-                                'Utilise le thème du système',
-                                Icons.brightness_auto,
-                              ),
-                              _buildThemeOption(
-                                context,
-                                AppThemeMode.light,
-                                'Clair',
-                                'Thème clair',
-                                Icons.wb_sunny,
-                              ),
-                              _buildThemeOption(
-                                context,
-                                AppThemeMode.dark,
-                                'Sombre',
-                                'Thème sombre',
-                                Icons.nightlight_round,
-                              ),
-                            ],
-                          ),
-                        ),
-                        actions: [
-                          TextButton(
-                            onPressed: () => Navigator.pop(context),
-                            child: const Text('Annuler'),
-                          ),
-                        ],
-                      ),
-                    );
-                  },
-                  child: Padding(
+                const SizedBox(height: 28),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 24),
+                  child: _buildSearchField(),
+                ),
+                const SizedBox(height: 20),
+                // Status pill
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 24),
+                  child: Container(
                     padding: const EdgeInsets.symmetric(
-                      horizontal: 20,
-                      vertical: 16,
+                      horizontal: 12,
+                      vertical: 8,
+                    ),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(20),
+                      color: colorScheme.onSurface.withAlpha(8),
                     ),
                     child: Row(
                       children: [
-                        Icon(
-                          Icons.brightness_medium,
-                          size: 20,
-                          color: colorScheme.onSurfaceVariant,
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Text(
-                            'Thème',
-                            style: GoogleFonts.plusJakartaSans(
-                              fontSize: 14,
-                              fontWeight: FontWeight.w600,
-                              color: colorScheme.onSurfaceVariant,
+                        AnimatedBuilder(
+                          animation: _pulseAnimation,
+                          builder: (_, __) => Transform.scale(
+                            scale: _pulseAnimation.value,
+                            child: Container(
+                              width: 7,
+                              height: 7,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: widget.devices.isNotEmpty
+                                    ? colorScheme.onSurface
+                                    : colorScheme.onSurfaceVariant,
+                              ),
                             ),
                           ),
                         ),
-                        Icon(
-                          Icons.chevron_right_rounded,
-                          size: 18,
-                          color: colorScheme.onSurfaceVariant,
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            widget.devices.isNotEmpty
+                                ? '${widget.devices.length} appareil(s)'
+                                : 'Recherche...',
+                            style: TextStyle(
+                              color: colorScheme.onSurfaceVariant,
+                              fontSize: 12,
+                              fontWeight: FontWeight.w500,
+                            ),
+                          ),
+                        ),
+                        IconButton(
+                          icon: Icon(
+                            widget.discoveryService.isDiscoverable
+                                ? Icons.visibility
+                                : Icons.visibility_off,
+                            size: 16,
+                            color: colorScheme.onSurfaceVariant,
+                          ),
+                          onPressed: () => setState(
+                            () =>
+                                widget.discoveryService.toggleDiscoverability(),
+                          ),
+                          tooltip: 'Visibilité',
+                          constraints: const BoxConstraints(),
+                          padding: EdgeInsets.zero,
+                        ),
+                        const SizedBox(width: 4),
+                        IconButton(
+                          icon: Icon(
+                            Icons.refresh,
+                            size: 16,
+                            color: colorScheme.onSurfaceVariant,
+                          ),
+                          onPressed: widget.onRefresh,
+                          tooltip: 'Rafraîchir',
+                          constraints: const BoxConstraints(),
+                          padding: EdgeInsets.zero,
                         ),
                       ],
                     ),
                   ),
                 ),
-                const SizedBox(height: 12),
+                const SizedBox(height: 16),
+                Expanded(child: _buildDevicesSection(isMobile: false)),
+                const Divider(height: 1),
+                _buildSidebarFooter(),
               ],
             ),
           ),
 
-          // Zone principale
+          // ── Main Content ──
           Expanded(
-            child: Column(
-              children: [
-                Container(
-                  padding: const EdgeInsets.fromLTRB(32, 32, 32, 16),
-                  child: Row(
-                    children: [
-                      _buildStatusBadge(),
-                      const Spacer(),
-                      if (_selectedDevice != null) _buildSendButton(),
-                    ],
-                  ),
+            child: Container(
+              decoration: BoxDecoration(
+                color: colorScheme.surfaceContainerLow,
+                borderRadius: const BorderRadius.only(
+                  topLeft: Radius.circular(20),
                 ),
-                Expanded(
-                  child: Padding(
-                    padding: const EdgeInsets.fromLTRB(32, 0, 32, 32),
-                    child: _buildFilesCard(isMobile: false),
+              ),
+              child: Column(
+                children: [
+                  // Custom window title bar (desktop only)
+                  if (Platform.isWindows ||
+                      Platform.isMacOS ||
+                      Platform.isLinux)
+                    CustomTitleBar(
+                      isLight: Theme.of(context).brightness == Brightness.light,
+                    ),
+                  // Top bar
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(40, 24, 40, 0),
+                    child: Row(
+                      children: [
+                        Expanded(child: _buildStatusBadge()),
+                        const SizedBox(width: 20),
+                        if (_selectedDevice != null) _buildSendButton(),
+                      ],
+                    ),
                   ),
-                ),
-              ],
+                  const SizedBox(height: 24),
+                  // Files area
+                  Expanded(
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(40, 0, 40, 32),
+                      child: _buildFilesCard(isMobile: false),
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
         ],
@@ -981,26 +931,357 @@ class _HomeScreenState extends State<HomeScreen>
     );
   }
 
-  // ─────────────────────── WIDGETS COMMUNS ───────────────────────
+  Widget _buildSearchField() {
+    final colorScheme = Theme.of(context).colorScheme;
+    if (widget.devices.isEmpty) return const SizedBox.shrink();
+    return TextField(
+      controller: _deviceSearchController,
+      style: TextStyle(fontSize: 13, color: colorScheme.onSurface),
+      decoration: InputDecoration(
+        hintText: 'Rechercher un appareil...',
+        hintStyle: TextStyle(fontSize: 13, color: colorScheme.onSurfaceVariant),
+        prefixIcon: Icon(
+          Icons.search,
+          size: 18,
+          color: colorScheme.onSurfaceVariant,
+        ),
+        filled: true,
+        fillColor: colorScheme.onSurface.withAlpha(6),
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: 14,
+          vertical: 10,
+        ),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: BorderSide.none,
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: BorderSide.none,
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: BorderSide(color: colorScheme.primary, width: 1.5),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSidebarFooter() {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Column(
+      children: [
+        if (_receiveDirectoryPath != null)
+          InkWell(
+            onTap: _openReceiveDirectory,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
+              child: Row(
+                children: [
+                  Icon(
+                    Icons.folder_open_rounded,
+                    size: 18,
+                    color: colorScheme.onSurfaceVariant,
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      'Dossier de réception',
+                      style: GoogleFonts.plusJakartaSans(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w500,
+                        color: colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ),
+                  Icon(
+                    Icons.chevron_right_rounded,
+                    size: 16,
+                    color: colorScheme.onSurfaceVariant,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        const Divider(height: 1),
+        InkWell(
+          onTap: () => _showThemeDialog(context),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
+            child: Row(
+              children: [
+                Icon(
+                  Icons.brightness_medium,
+                  size: 18,
+                  color: colorScheme.onSurfaceVariant,
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    'Thème',
+                    style: GoogleFonts.plusJakartaSans(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500,
+                      color: colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+                Icon(
+                  Icons.chevron_right_rounded,
+                  size: 16,
+                  color: colorScheme.onSurfaceVariant,
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 8),
+      ],
+    );
+  }
+
+  void _showThemeDialog(BuildContext context) {
+    final isMobile = MediaQuery.of(context).size.width <= 800;
+    if (isMobile) {
+      _showThemeBottomSheet(context);
+    } else {
+      _showThemeDesktopDialog(context);
+    }
+  }
+
+  void _showThemeBottomSheet(BuildContext context) {
+    final themeService = context.read<ThemeService>();
+
+    showModalBottomSheet(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.brightness_auto),
+              title: const Text('Système'),
+              subtitle: const Text('Utilise le thème du système'),
+              onTap: () async {
+                await themeService.setThemeMode(AppThemeMode.system);
+                if (context.mounted) Navigator.pop(context);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.wb_sunny),
+              title: const Text('Clair'),
+              subtitle: const Text('Thème clair'),
+              onTap: () async {
+                await themeService.setThemeMode(AppThemeMode.light);
+                if (context.mounted) Navigator.pop(context);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.nightlight_round),
+              title: const Text('Sombre'),
+              subtitle: const Text('Thème sombre'),
+              onTap: () async {
+                await themeService.setThemeMode(AppThemeMode.dark);
+                if (context.mounted) Navigator.pop(context);
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showThemeDesktopDialog(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final themeService = context.read<ThemeService>();
+
+    showDialog(
+      context: context,
+      builder: (context) => Dialog(
+        backgroundColor: colorScheme.surface,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        child: Container(
+          width: 380,
+          padding: const EdgeInsets.all(28),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Container(
+                    width: 40,
+                    height: 40,
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(10),
+                      color: colorScheme.onSurface.withAlpha(10),
+                    ),
+                    child: Icon(
+                      Icons.palette_outlined,
+                      color: colorScheme.onSurface,
+                      size: 20,
+                    ),
+                  ),
+                  const SizedBox(width: 14),
+                  Text(
+                    'Apparence',
+                    style: GoogleFonts.plusJakartaSans(
+                      fontSize: 20,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Choisis comment GoSend s\'affiche.',
+                style: TextStyle(
+                  fontSize: 13,
+                  color: colorScheme.onSurfaceVariant,
+                ),
+              ),
+              const SizedBox(height: 24),
+              _buildThemeTile(
+                context,
+                themeService,
+                AppThemeMode.system,
+                'Système',
+                'Utilise le thème du système',
+                Icons.brightness_auto,
+              ),
+              const SizedBox(height: 8),
+              _buildThemeTile(
+                context,
+                themeService,
+                AppThemeMode.light,
+                'Clair',
+                'Fond clair et texte sombre',
+                Icons.wb_sunny,
+              ),
+              const SizedBox(height: 8),
+              _buildThemeTile(
+                context,
+                themeService,
+                AppThemeMode.dark,
+                'Sombre',
+                'Fond sombre et texte clair',
+                Icons.nightlight_round,
+              ),
+              const SizedBox(height: 24),
+              Align(
+                alignment: Alignment.centerRight,
+                child: TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: Text(
+                    'Fermer',
+                    style: TextStyle(color: colorScheme.onSurfaceVariant),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildThemeTile(
+    BuildContext context,
+    ThemeService themeService,
+    AppThemeMode mode,
+    String title,
+    String subtitle,
+    IconData icon,
+  ) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final isSelected = themeService.themeMode == mode;
+
+    return InkWell(
+      onTap: () async {
+        await themeService.setThemeMode(mode);
+        if (context.mounted) Navigator.pop(context);
+      },
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(12),
+          color: isSelected ? colorScheme.onSurface.withAlpha(8) : null,
+          border: Border.all(
+            color: isSelected
+                ? colorScheme.onSurface
+                : colorScheme.outlineVariant,
+            width: isSelected ? 1.5 : 1,
+          ),
+        ),
+        child: Row(
+          children: [
+            Container(
+              width: 40,
+              height: 40,
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(10),
+                color: colorScheme.onSurface.withAlpha(10),
+              ),
+              child: Icon(
+                icon,
+                size: 20,
+                color: isSelected
+                    ? colorScheme.onSurface
+                    : colorScheme.onSurfaceVariant,
+              ),
+            ),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    style: GoogleFonts.plusJakartaSans(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w700,
+                      color: colorScheme.onSurface,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    subtitle,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (isSelected)
+              Container(
+                width: 22,
+                height: 22,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: colorScheme.onSurface,
+                ),
+                child: Icon(Icons.check, size: 14, color: colorScheme.surface),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ─────────────── STATUS CARD (Mobile) ───────────────
 
   Widget _buildStatusCard() {
+    final colorScheme = Theme.of(context).colorScheme;
+    final isActive = widget.devices.isNotEmpty;
     return Container(
       padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
-        gradient: LinearGradient(
-          colors: widget.devices.isNotEmpty
-              ? [
-                  const Color(0xFF1DB954).withAlpha(30),
-                  const Color(0xFF1DB954).withAlpha(10),
-                ]
-              : [Colors.orange.withAlpha(30), Colors.orange.withAlpha(10)],
-        ),
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(
-          color: widget.devices.isNotEmpty
-              ? Colors.green.withAlpha(80)
-              : Colors.orange.withAlpha(80),
-        ),
+        color: colorScheme.surface,
+        border: Border.all(color: colorScheme.outlineVariant),
       ),
       child: Row(
         children: [
@@ -1008,10 +1289,18 @@ class _HomeScreenState extends State<HomeScreen>
             animation: _pulseAnimation,
             builder: (_, __) => Transform.scale(
               scale: _pulseAnimation.value,
-              child: Icon(
-                Icons.wifi_tethering,
-                size: 36,
-                color: widget.devices.isNotEmpty ? Colors.green : Colors.orange,
+              child: Container(
+                width: 48,
+                height: 48,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: colorScheme.onSurface.withAlpha(10),
+                ),
+                child: Icon(
+                  Icons.wifi_tethering,
+                  size: 24,
+                  color: colorScheme.onSurface,
+                ),
               ),
             ),
           ),
@@ -1021,20 +1310,19 @@ class _HomeScreenState extends State<HomeScreen>
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  widget.devices.isNotEmpty
-                      ? 'Réseau actif'
-                      : 'Recherche en cours...',
+                  isActive ? 'Réseau actif' : 'Recherche en cours...',
                   style: GoogleFonts.plusJakartaSans(
                     fontSize: 16,
                     fontWeight: FontWeight.w700,
                   ),
                 ),
+                const SizedBox(height: 2),
                 Text(
-                  widget.devices.isNotEmpty
+                  isActive
                       ? '${widget.devices.length} appareil(s) détecté(s)'
                       : 'En attente d\'autres appareils GoSend sur le Wi-Fi',
                   style: TextStyle(
-                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    color: colorScheme.onSurfaceVariant,
                     fontSize: 13,
                   ),
                 ),
@@ -1047,42 +1335,60 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   Widget _buildStatusBadge() {
+    final colorScheme = Theme.of(context).colorScheme;
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
       decoration: BoxDecoration(
-        color: _isTransferring
-            ? Colors.blue.withAlpha(20)
-            : Colors.green.withAlpha(20),
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(
-          color: _isTransferring
-              ? Colors.blue.withAlpha(80)
-              : Colors.green.withAlpha(80),
-        ),
+        borderRadius: BorderRadius.circular(24),
+        color: colorScheme.surface,
+        border: Border.all(color: colorScheme.outlineVariant),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(
-            _isTransferring ? Icons.sync : Icons.check_circle,
-            size: 16,
-            color: _isTransferring ? Colors.blue : Colors.green,
+          SizedBox(
+            width: 14,
+            height: 14,
+            child: _isTransferring
+                ? SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: colorScheme.primary,
+                    ),
+                  )
+                : Icon(
+                    Icons.check_circle_outline,
+                    size: 14,
+                    color: colorScheme.onSurface,
+                  ),
           ),
           const SizedBox(width: 8),
-          Text(
-            _statusMessage,
-            style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
+          Flexible(
+            child: Text(
+              _statusMessage,
+              style: GoogleFonts.plusJakartaSans(
+                fontWeight: FontWeight.w600,
+                fontSize: 13,
+                color: colorScheme.onSurface,
+              ),
+              overflow: TextOverflow.ellipsis,
+            ),
           ),
         ],
       ),
     );
   }
 
+  // ─────────────── FILES CARD ───────────────
+
   Widget _buildFilesCard({required bool isMobile}) {
+    final colorScheme = Theme.of(context).colorScheme;
     return DropTarget(
       onDragDone: (details) {
         setState(() {
-          _selectedFiles = details.files.map((f) => File(f.path)).toList();
+          _selectedFiles.addAll(details.files.map((f) => File(f.path)));
           _isDragging = false;
         });
       },
@@ -1090,148 +1396,78 @@ class _HomeScreenState extends State<HomeScreen>
       onDragExited: (_) => setState(() => _isDragging = false),
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 200),
-        padding: const EdgeInsets.all(24),
+        padding: EdgeInsets.all(isMobile ? 20 : 28),
         decoration: BoxDecoration(
           borderRadius: BorderRadius.circular(20),
+          color: _isDragging
+              ? colorScheme.primary.withAlpha(8)
+              : colorScheme.surface,
           border: Border.all(
             color: _isDragging
-                ? Theme.of(context).colorScheme.primary
-                : Theme.of(context).colorScheme.outlineVariant.withAlpha(80),
-            width: _isDragging ? 2.5 : 1.5,
-            strokeAlign: BorderSide.strokeAlignOutside,
+                ? colorScheme.primary
+                : colorScheme.outlineVariant,
+            width: _isDragging ? 2 : 1,
           ),
-          color: _isDragging
-              ? Theme.of(context).colorScheme.primary.withAlpha(15)
-              : Theme.of(context).colorScheme.surface,
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
+            // Header
             Row(
               children: [
-                Icon(
-                  Icons.folder_open_rounded,
-                  color: Theme.of(context).colorScheme.primary,
-                  size: 22,
+                Container(
+                  width: 36,
+                  height: 36,
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(10),
+                    color: colorScheme.onSurface.withAlpha(10),
+                  ),
+                  child: Icon(
+                    Icons.folder_outlined,
+                    size: 18,
+                    color: colorScheme.onSurface,
+                  ),
                 ),
-                const SizedBox(width: 10),
+                const SizedBox(width: 12),
                 Expanded(
                   child: Text(
                     'Fichiers à envoyer',
                     style: GoogleFonts.plusJakartaSans(
-                      fontSize: 16,
+                      fontSize: isMobile ? 16 : 18,
                       fontWeight: FontWeight.w700,
                     ),
-                    overflow: TextOverflow.ellipsis,
                   ),
                 ),
-                TextButton.icon(
+                FilledButton.icon(
                   onPressed: _pickFiles,
                   icon: const Icon(Icons.add, size: 18),
-                  label: const Text('Ajouter'),
-                  style: TextButton.styleFrom(
-                    backgroundColor: Theme.of(
-                      context,
-                    ).colorScheme.primary.withAlpha(15),
+                  label: Text(isMobile ? 'Ajouter' : 'Ajouter des fichiers'),
+                  style: FilledButton.styleFrom(
                     padding: const EdgeInsets.symmetric(
                       horizontal: 16,
-                      vertical: 8,
+                      vertical: 10,
                     ),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(10),
+                    textStyle: GoogleFonts.plusJakartaSans(
+                      fontWeight: FontWeight.w600,
                     ),
                   ),
                 ),
               ],
             ),
-            const SizedBox(height: 16),
+            const SizedBox(height: 20),
+
+            // Empty state or file list
             if (_selectedFiles.isEmpty)
               _buildEmptyDropZone(isMobile: isMobile)
             else
               _buildFilesList(),
+
+            // Progress section
             if (_isTransferring) ...[
-              const SizedBox(height: 16),
-              ClipRRect(
-                borderRadius: BorderRadius.circular(8),
-                child: LinearProgressIndicator(
-                  value: _progress,
-                  minHeight: 8,
-                  backgroundColor: Theme.of(
-                    context,
-                  ).colorScheme.outlineVariant.withAlpha(40),
-                  valueColor: AlwaysStoppedAnimation<Color>(
-                    Theme.of(context).colorScheme.primary,
-                  ),
-                ),
-              ),
-              const SizedBox(height: 8),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Expanded(
-                    child: Text(
-                      _isTransferring && _currentReceivingRequest != null
-                          ? '${_formatProgress(_progress, _totalBytesToReceive)}  —  $_statusMessage'
-                          : '${(_progress * 100).toStringAsFixed(0)}%  —  $_statusMessage',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: Theme.of(context).colorScheme.onSurfaceVariant,
-                      ),
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                  Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      IconButton(
-                        icon: Icon(
-                          _isPaused ? Icons.play_arrow : Icons.pause,
-                          size: 20,
-                        ),
-                        onPressed: () {
-                          final action = _isPaused ? 'resume' : 'pause';
-                          if (_currentReceivingRequest != null) {
-                            _httpService.sendControlMessage(
-                              _currentReceivingRequest!.id,
-                              action,
-                            );
-                          } else if (_currentTransferId != null) {
-                            _httpService.sendControlMessage(
-                              _currentTransferId!,
-                              action,
-                            );
-                          }
-                          setState(() => _isPaused = !_isPaused);
-                        },
-                      ),
-                      IconButton(
-                        icon: const Icon(
-                          Icons.close,
-                          size: 20,
-                          color: Colors.red,
-                        ),
-                        onPressed: () {
-                          if (_currentReceivingRequest != null) {
-                            _httpService.sendControlMessage(
-                              _currentReceivingRequest!.id,
-                              'cancel',
-                            );
-                          } else if (_currentTransferId != null) {
-                            _httpService.sendControlMessage(
-                              _currentTransferId!,
-                              'cancel',
-                            );
-                          }
-                          setState(() {
-                            _isTransferring = false;
-                            _statusMessage = 'Annulé';
-                          });
-                        },
-                      ),
-                    ],
-                  ),
-                ],
-              ),
+              const SizedBox(height: 24),
+              const Divider(height: 1),
+              const SizedBox(height: 24),
+              _buildProgressSection(),
             ],
           ],
         ),
@@ -1240,82 +1476,268 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   Widget _buildEmptyDropZone({required bool isMobile}) {
+    final colorScheme = Theme.of(context).colorScheme;
     return Container(
-      height: isMobile ? 140 : 240,
+      height: isMobile ? 160 : 280,
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(14),
-        color: Theme.of(context).colorScheme.onSurface.withAlpha(5),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: colorScheme.outlineVariant,
+          style: BorderStyle.solid,
+        ),
       ),
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
           Icon(
             Icons.cloud_upload_outlined,
-            size: 48,
-            color: Theme.of(
-              context,
-            ).colorScheme.onSurfaceVariant.withAlpha(120),
+            size: isMobile ? 40 : 52,
+            color: colorScheme.onSurfaceVariant.withAlpha(100),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 14),
           Text(
             isMobile ? 'Appuie sur "Ajouter"' : 'Glisse tes fichiers ici',
             style: GoogleFonts.plusJakartaSans(
-              fontSize: 16,
+              fontSize: 15,
               fontWeight: FontWeight.w600,
-              color: Theme.of(context).colorScheme.onSurfaceVariant,
+              color: colorScheme.onSurfaceVariant,
             ),
           ),
-          if (!isMobile)
-            Padding(
-              padding: const EdgeInsets.only(top: 4),
-              child: Text(
-                'ou clique sur "Ajouter" pour choisir des fichiers',
-                style: TextStyle(
-                  fontSize: 13,
-                  color: Theme.of(
-                    context,
-                  ).colorScheme.onSurfaceVariant.withAlpha(150),
-                ),
+          if (!isMobile) ...[
+            const SizedBox(height: 4),
+            Text(
+              'ou clique sur "Ajouter" pour choisir',
+              style: TextStyle(
+                fontSize: 13,
+                color: colorScheme.onSurfaceVariant.withAlpha(150),
               ),
             ),
+          ],
         ],
       ),
     );
   }
 
-  Widget _buildFilesList() {
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final bool isDesktop = constraints.maxWidth > 400;
-        return Wrap(
-          spacing: 8,
-          runSpacing: 8,
-          children: _selectedFiles.map((file) {
-            final name = file.path.split(Platform.pathSeparator).last;
-            final content = _buildFileItemContent(file, name);
-            return SizedBox(
-              width: isDesktop
-                  ? (constraints.maxWidth - 8) / 2
-                  : double.infinity,
-              child: content,
-            );
-          }).toList(),
-        );
-      },
+  Widget _buildProgressSection() {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        // Progress bar
+        Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(14),
+            color: colorScheme.onSurface.withAlpha(5),
+          ),
+          child: Column(
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: [
+                  Text(
+                    '${(_progress * 100).toStringAsFixed(0)}%',
+                    style: GoogleFonts.plusJakartaSans(
+                      fontSize: 24,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Flexible(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.end,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          _formatProgress(_progress, _totalBytesToReceive),
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: colorScheme.onSurfaceVariant,
+                            fontWeight: FontWeight.w500,
+                          ),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        Text(
+                          _statusMessage,
+                          style: TextStyle(
+                            fontSize: 11,
+                            color: colorScheme.onSurfaceVariant.withAlpha(150),
+                          ),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(6),
+                child: SizedBox(
+                  height: 8,
+                  child: Stack(
+                    children: [
+                      // Background track
+                      Container(
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(6),
+                          color: colorScheme.outlineVariant,
+                        ),
+                      ),
+                      // Animated progress fill
+                      AnimatedFractionallySizedBox(
+                        duration: const Duration(milliseconds: 300),
+                        widthFactor: _progress,
+                        child: Container(
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(6),
+                            color: colorScheme.onSurface,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 12),
+        // Control buttons
+        Row(
+          mainAxisAlignment: MainAxisAlignment.end,
+          children: [
+            // Pause / Resume
+            Container(
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: colorScheme.outlineVariant),
+              ),
+              child: Material(
+                color: Colors.transparent,
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(10),
+                  onTap: () {
+                    if (_isPaused) {
+                      _resumeTransfer();
+                    } else {
+                      _pauseTransfer();
+                    }
+                  },
+                  child: Padding(
+                    padding: const EdgeInsets.all(8),
+                    child: Icon(
+                      _isPaused ? Icons.play_arrow : Icons.pause,
+                      size: 20,
+                      color: colorScheme.onSurface,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            // Cancel
+            Container(
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: colorScheme.outlineVariant),
+              ),
+              child: Material(
+                color: Colors.transparent,
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(10),
+                  onTap: () {
+                    _cancelTransfer();
+                  },
+                  child: Padding(
+                    padding: const EdgeInsets.all(8),
+                    child: Icon(
+                      Icons.close,
+                      size: 20,
+                      color: colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ],
     );
   }
 
-  Widget _buildFileItemContent(File file, String name) {
+  Widget _buildFilesList() {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Column(
+      children: [
+        LayoutBuilder(
+          builder: (context, constraints) {
+            final bool isDesktop = constraints.maxWidth > 400;
+            return Wrap(
+              spacing: 10,
+              runSpacing: 10,
+              children: _selectedFiles.map((file) {
+                final name = file.path.split(Platform.pathSeparator).last;
+                return SizedBox(
+                  width: isDesktop
+                      ? (constraints.maxWidth - 10) / 2
+                      : double.infinity,
+                  child: _buildFileItem(file, name),
+                );
+              }).toList(),
+            );
+          },
+        ),
+        const SizedBox(height: 16),
+        InkWell(
+          onTap: () => setState(() => _selectedFiles.clear()),
+          borderRadius: BorderRadius.circular(12),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(12),
+              color: colorScheme.onSurface.withAlpha(5),
+              border: Border.all(color: colorScheme.outlineVariant),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  Icons.clear_all,
+                  size: 16,
+                  color: colorScheme.onSurfaceVariant,
+                ),
+                const SizedBox(width: 6),
+                Text(
+                  'Vider',
+                  style: GoogleFonts.plusJakartaSans(
+                    fontWeight: FontWeight.w600,
+                    fontSize: 13,
+                    color: colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildFileItem(File file, String name) {
+    final colorScheme = Theme.of(context).colorScheme;
     final ext = name.contains('.') ? name.split('.').last.toLowerCase() : '';
     final isImage = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].contains(ext);
+    final fileIndex = _selectedFiles.indexOf(file);
+    final progress = _fileProgress[fileIndex] ?? 0.0;
+
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       decoration: BoxDecoration(
-        color: Theme.of(context).colorScheme.primary.withAlpha(8),
         borderRadius: BorderRadius.circular(12),
-        border: Border.all(
-          color: Theme.of(context).colorScheme.primary.withAlpha(25),
-        ),
+        color: colorScheme.onSurface.withAlpha(5),
+        border: Border.all(color: colorScheme.outlineVariant.withAlpha(80)),
       ),
       child: Row(
         children: [
@@ -1343,7 +1765,9 @@ class _HomeScreenState extends State<HomeScreen>
                     fontSize: 13,
                   ),
                   overflow: TextOverflow.ellipsis,
+                  maxLines: 1,
                 ),
+                const SizedBox(height: 2),
                 FutureBuilder<int>(
                   future: file.length(),
                   builder: (_, snap) {
@@ -1352,23 +1776,57 @@ class _HomeScreenState extends State<HomeScreen>
                       _formatSize(snap.data!),
                       style: TextStyle(
                         fontSize: 11,
-                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                        color: colorScheme.onSurfaceVariant,
                       ),
                     );
                   },
                 ),
+                if (_isTransferring && progress > 0) ...[
+                  const SizedBox(height: 6),
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(4),
+                    child: SizedBox(
+                      height: 4,
+                      child: Stack(
+                        children: [
+                          Container(
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(4),
+                              color: colorScheme.outlineVariant,
+                            ),
+                          ),
+                          AnimatedFractionallySizedBox(
+                            duration: const Duration(milliseconds: 300),
+                            widthFactor: progress,
+                            child: Container(
+                              decoration: BoxDecoration(
+                                borderRadius: BorderRadius.circular(4),
+                                color: colorScheme.primary,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
               ],
             ),
           ),
-          IconButton(
-            icon: Icon(
-              Icons.close_rounded,
-              size: 16,
-              color: Theme.of(context).colorScheme.onSurfaceVariant,
+          Material(
+            color: Colors.transparent,
+            child: InkWell(
+              borderRadius: BorderRadius.circular(20),
+              onTap: () => setState(() => _selectedFiles.remove(file)),
+              child: Padding(
+                padding: const EdgeInsets.all(4),
+                child: Icon(
+                  Icons.close_rounded,
+                  size: 16,
+                  color: colorScheme.onSurfaceVariant,
+                ),
+              ),
             ),
-            onPressed: () => setState(() => _selectedFiles.remove(file)),
-            padding: EdgeInsets.zero,
-            constraints: const BoxConstraints(),
           ),
         ],
       ),
@@ -1376,36 +1834,23 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   Widget _fileIconBox(String name) {
+    final colorScheme = Theme.of(context).colorScheme;
     return Container(
       width: 48,
       height: 48,
       decoration: BoxDecoration(
-        color: Theme.of(context).colorScheme.primary.withAlpha(15),
         borderRadius: BorderRadius.circular(8),
+        color: colorScheme.onSurface.withAlpha(10),
       ),
       child: Icon(
         _iconForFile(name),
-        size: 24,
-        color: Theme.of(context).colorScheme.primary,
+        size: 22,
+        color: colorScheme.onSurfaceVariant,
       ),
     );
   }
 
-  String _formatSize(int bytes) {
-    if (bytes < 1024) return '$bytes B';
-    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
-    if (bytes < 1024 * 1024 * 1024) {
-      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
-    }
-    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
-  }
-
-  String _formatProgress(double progress, int totalBytes) {
-    final receivedMB = (progress * totalBytes) / (1024 * 1024);
-    final totalMB = totalBytes / (1024 * 1024);
-    final percent = (progress * 100).toStringAsFixed(1);
-    return '${receivedMB.toStringAsFixed(1)} / ${totalMB.toStringAsFixed(1)} MB ($percent%)';
-  }
+  // ─────────────── DEVICES SECTION ───────────────
 
   Widget _buildDevicesSection({required bool isMobile}) {
     final colorScheme = Theme.of(context).colorScheme;
@@ -1420,49 +1865,37 @@ class _HomeScreenState extends State<HomeScreen>
     return Column(
       mainAxisSize: isMobile ? MainAxisSize.min : MainAxisSize.max,
       children: [
-        if (!isMobile && widget.devices.isNotEmpty) ...[
+        _buildLocalDeviceCard(isMobile),
+        const SizedBox(height: 12),
+        if (widget.devices.isNotEmpty) ...[
           Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
-            child: SizedBox(
-              height: 36,
-              child: TextField(
-                controller: _deviceSearchController,
-                style: const TextStyle(fontSize: 12),
-                textAlign: TextAlign.center,
-                decoration: InputDecoration(
-                  hintText: 'Rechercher...',
-                  hintStyle: TextStyle(
-                    fontSize: 12,
-                    color: colorScheme.onSurfaceVariant.withAlpha(150),
-                  ),
-                  filled: true,
-                  fillColor: colorScheme.onSurface.withAlpha(6),
-                  contentPadding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 6,
-                  ),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(18),
-                    borderSide: BorderSide.none,
-                  ),
-                  enabledBorder: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(18),
-                    borderSide: BorderSide.none,
-                  ),
-                  focusedBorder: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(18),
-                    borderSide: BorderSide(
-                      color: colorScheme.primary.withAlpha(120),
-                    ),
+            padding: EdgeInsets.symmetric(
+              horizontal: isMobile ? 0 : 16,
+              vertical: 8,
+            ),
+            child: Row(
+              children: [
+                Text(
+                  'Appareils détectés',
+                  style: GoogleFonts.plusJakartaSans(
+                    fontSize: isMobile ? 15 : 13,
+                    fontWeight: FontWeight.w700,
+                    color: colorScheme.onSurface,
                   ),
                 ),
-              ),
+                const Spacer(),
+                Text(
+                  '${widget.devices.length}',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
             ),
           ),
           const SizedBox(height: 4),
         ],
-        _buildLocalDeviceCard(isMobile),
-        const SizedBox(height: 12),
         if (isMobile)
           filteredDevices.isEmpty
               ? _buildEmptyDevicesState(isMobile)
@@ -1479,28 +1912,33 @@ class _HomeScreenState extends State<HomeScreen>
 
   Widget _buildLocalDeviceCard(bool isMobile) {
     final colorScheme = Theme.of(context).colorScheme;
-
     return Container(
+      margin: isMobile ? null : const EdgeInsets.symmetric(horizontal: 16),
       padding: EdgeInsets.symmetric(
-        horizontal: isMobile ? 12 : 16,
-        vertical: isMobile ? 8 : 12,
+        horizontal: isMobile ? 14 : 16,
+        vertical: isMobile ? 10 : 12,
       ),
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(12),
         color: colorScheme.surface,
-        border: Border.all(
-          color: colorScheme.outlineVariant.withAlpha(40),
-          width: 1,
-        ),
+        border: Border.all(color: colorScheme.outlineVariant),
       ),
       child: Row(
         children: [
-          Icon(
-            Icons.computer,
-            color: colorScheme.onSurfaceVariant,
-            size: isMobile ? 16 : 18,
+          Container(
+            width: 36,
+            height: 36,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: colorScheme.onSurface.withAlpha(10),
+            ),
+            child: Icon(
+              Icons.computer,
+              size: isMobile ? 16 : 18,
+              color: colorScheme.onSurface,
+            ),
           ),
-          const SizedBox(width: 8),
+          const SizedBox(width: 12),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -1509,7 +1947,7 @@ class _HomeScreenState extends State<HomeScreen>
                 Text(
                   widget.localDeviceName,
                   style: GoogleFonts.plusJakartaSans(
-                    fontSize: isMobile ? 11 : 12,
+                    fontSize: isMobile ? 13 : 12,
                     fontWeight: FontWeight.w600,
                     color: colorScheme.onSurface,
                   ),
@@ -1518,8 +1956,8 @@ class _HomeScreenState extends State<HomeScreen>
                 ),
                 Text(
                   widget.localIpAddress,
-                  style: GoogleFonts.plusJakartaSans(
-                    fontSize: isMobile ? 10 : 11,
+                  style: GoogleFonts.inter(
+                    fontSize: isMobile ? 11 : 11,
                     color: colorScheme.onSurfaceVariant,
                   ),
                   maxLines: 1,
@@ -1528,10 +1966,14 @@ class _HomeScreenState extends State<HomeScreen>
               ],
             ),
           ),
-          Icon(
-            Icons.check_circle,
-            color: colorScheme.primary,
-            size: isMobile ? 14 : 16,
+          Container(
+            width: 24,
+            height: 24,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: colorScheme.onSurface.withAlpha(15),
+            ),
+            child: Icon(Icons.check, size: 14, color: colorScheme.onSurface),
           ),
         ],
       ),
@@ -1540,82 +1982,65 @@ class _HomeScreenState extends State<HomeScreen>
 
   Widget _buildEmptyDevicesState(bool isMobile) {
     final colorScheme = Theme.of(context).colorScheme;
-
     return Padding(
-      padding: EdgeInsets.all(isMobile ? 0 : 20),
-      child: isMobile
-          ? Container(
-              padding: const EdgeInsets.all(20),
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(16),
-                color: colorScheme.surface,
-                border: Border.all(
-                  color: colorScheme.outlineVariant.withAlpha(60),
-                ),
-              ),
-              child: const Center(
-                child: Column(
-                  children: [
-                    Icon(Icons.devices_other, size: 36, color: Colors.grey),
-                    SizedBox(height: 8),
-                    Text(
-                      'Aucun appareil détecté',
-                      style: TextStyle(fontWeight: FontWeight.w600),
-                    ),
-                    SizedBox(height: 4),
-                    Text(
-                      'Assure-toi que GoSend est ouvert sur l\'autre appareil sur le même Wi-Fi',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(fontSize: 12, color: Colors.grey),
-                    ),
-                  ],
-                ),
-              ),
-            )
-          : const Column(
-              children: [
-                Icon(Icons.devices_other, size: 36, color: Colors.grey),
-                SizedBox(height: 8),
-                Text(
-                  'Aucun appareil',
-                  style: TextStyle(fontWeight: FontWeight.w600),
-                ),
-                SizedBox(height: 4),
-                Padding(
-                  padding: EdgeInsets.symmetric(horizontal: 8),
-                  child: Text(
-                    'Ouvre GoSend sur un autre appareil sur le même Wi-Fi',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(fontSize: 12, color: Colors.grey),
-                  ),
-                ),
-              ],
+      padding: EdgeInsets.all(isMobile ? 0 : 24),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            Icons.devices_other,
+            size: 40,
+            color: colorScheme.onSurfaceVariant.withAlpha(80),
+          ),
+          const SizedBox(height: 12),
+          Text(
+            'Aucun appareil',
+            style: GoogleFonts.plusJakartaSans(
+              fontWeight: FontWeight.w600,
+              fontSize: 14,
+              color: colorScheme.onSurfaceVariant,
             ),
+          ),
+          const SizedBox(height: 4),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            child: Text(
+              'Ouvre GoSend sur un autre appareil sur le même Wi-Fi',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontSize: 12,
+                color: colorScheme.onSurfaceVariant.withAlpha(150),
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 
   Widget _buildDevicesList(bool isMobile, List<dynamic> devices) {
     final deviceWidgets = devices.map((device) {
       final isSelected = _selectedDevice?.id == device.id;
+      final colorScheme = Theme.of(context).colorScheme;
       return GestureDetector(
         onTap: () =>
             setState(() => _selectedDevice = isSelected ? null : device),
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 180),
           margin: EdgeInsets.symmetric(
-            horizontal: isMobile ? 0 : 12,
+            horizontal: isMobile ? 0 : 16,
             vertical: 5,
           ),
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(14),
             color: isSelected
-                ? Theme.of(context).colorScheme.primary.withAlpha(20)
-                : Theme.of(context).colorScheme.surface,
+                ? colorScheme.onSurface.withAlpha(10)
+                : colorScheme.surface,
             border: Border.all(
               color: isSelected
-                  ? Theme.of(context).colorScheme.primary
-                  : Theme.of(context).colorScheme.outlineVariant.withAlpha(60),
+                  ? colorScheme.onSurface
+                  : colorScheme.outlineVariant.withAlpha(60),
               width: isSelected ? 2 : 1,
             ),
           ),
@@ -1626,12 +2051,12 @@ class _HomeScreenState extends State<HomeScreen>
                 height: 40,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
-                  color: Theme.of(context).colorScheme.primary.withAlpha(15),
+                  color: colorScheme.onSurface.withAlpha(10),
                 ),
                 child: Icon(
                   _iconForOs(device.os),
                   size: 20,
-                  color: Theme.of(context).colorScheme.primary,
+                  color: colorScheme.onSurface,
                 ),
               ),
               const SizedBox(width: 12),
@@ -1641,16 +2066,17 @@ class _HomeScreenState extends State<HomeScreen>
                   children: [
                     Text(
                       device.name,
-                      style: const TextStyle(
+                      style: GoogleFonts.plusJakartaSans(
                         fontWeight: FontWeight.w700,
-                        fontSize: 14,
+                        fontSize: 13,
+                        color: colorScheme.onSurface,
                       ),
                       overflow: TextOverflow.ellipsis,
                     ),
                     Text(
                       device.ip,
                       style: TextStyle(
-                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                        color: colorScheme.onSurfaceVariant,
                         fontSize: 11,
                       ),
                     ),
@@ -1658,10 +2084,18 @@ class _HomeScreenState extends State<HomeScreen>
                 ),
               ),
               if (isSelected)
-                Icon(
-                  Icons.check_circle_rounded,
-                  size: 18,
-                  color: Theme.of(context).colorScheme.primary,
+                Container(
+                  width: 22,
+                  height: 22,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: colorScheme.onSurface,
+                  ),
+                  child: Icon(
+                    Icons.check,
+                    size: 14,
+                    color: colorScheme.surface,
+                  ),
                 ),
             ],
           ),
@@ -1672,51 +2106,61 @@ class _HomeScreenState extends State<HomeScreen>
     if (isMobile) {
       return Column(
         crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            'Appareils détectés',
-            style: GoogleFonts.plusJakartaSans(
-              fontSize: 15,
-              fontWeight: FontWeight.w700,
-            ),
-          ),
-          const SizedBox(height: 8),
-          ...deviceWidgets,
-        ],
+        children: deviceWidgets,
       );
     }
-    return ListView(children: deviceWidgets);
+    return ListView(
+      padding: const EdgeInsets.only(bottom: 16),
+      children: deviceWidgets,
+    );
   }
 
+  // ─────────────── SEND BUTTON ───────────────
+
   Widget _buildSendButton() {
-    return ElevatedButton.icon(
+    final colorScheme = Theme.of(context).colorScheme;
+    return FilledButton.icon(
       onPressed: _isConnecting || _isTransferring ? null : _sendFiles,
       icon: _isConnecting || _isTransferring
-          ? const SizedBox(
+          ? SizedBox(
               width: 16,
               height: 16,
               child: CircularProgressIndicator(
                 strokeWidth: 2,
-                color: Colors.white,
+                color: colorScheme.onPrimary,
               ),
             )
-          : const Icon(Icons.send_rounded, size: 20),
+          : const Icon(Icons.send_rounded, size: 18),
       label: Text(
         _isConnecting
             ? 'Connexion...'
             : _isTransferring
             ? 'Envoi...'
-            : 'Envoyer vers ${_selectedDevice?.name ?? ""}',
+            : 'Envoyer',
         style: GoogleFonts.plusJakartaSans(fontWeight: FontWeight.w700),
       ),
-      style: ElevatedButton.styleFrom(
-        backgroundColor: Theme.of(context).colorScheme.primary,
-        foregroundColor: Theme.of(context).colorScheme.onPrimary,
+      style: FilledButton.styleFrom(
         padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        elevation: 0,
+        textStyle: GoogleFonts.plusJakartaSans(fontWeight: FontWeight.w700),
       ),
     );
+  }
+
+  // ─────────────── HELPERS ───────────────
+
+  String _formatSize(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    if (bytes < 1024 * 1024 * 1024)
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
+  }
+
+  String _formatProgress(double progress, int totalBytes) {
+    final receivedMB = (progress * totalBytes) / (1024 * 1024);
+    final totalMB = totalBytes / (1024 * 1024);
+    final percent = (progress * 100).toStringAsFixed(1);
+    return '${receivedMB.toStringAsFixed(1)} / ${totalMB.toStringAsFixed(1)} MB ($percent%)';
   }
 
   IconData _iconForOs(String os) {
@@ -1725,51 +2169,6 @@ class _HomeScreenState extends State<HomeScreen>
     if (lower.contains('ios') || lower.contains('mac')) return Icons.apple;
     if (lower.contains('windows')) return Icons.window;
     return Icons.devices;
-  }
-
-  Widget _buildThemeOption(
-    BuildContext context,
-    AppThemeMode mode,
-    String title,
-    String subtitle,
-    IconData icon,
-  ) {
-    final themeService = context.read<ThemeService>();
-    final isSelected = themeService.themeMode == mode;
-    final colorScheme = Theme.of(context).colorScheme;
-
-    return ListTile(
-      leading: Icon(
-        icon,
-        color: isSelected ? colorScheme.primary : colorScheme.onSurfaceVariant,
-      ),
-      title: Text(
-        title,
-        style: GoogleFonts.plusJakartaSans(
-          fontWeight: isSelected ? FontWeight.w600 : FontWeight.w500,
-          color: isSelected ? colorScheme.primary : colorScheme.onSurface,
-        ),
-      ),
-      subtitle: Text(
-        subtitle,
-        style: TextStyle(
-          color: colorScheme.onSurfaceVariant,
-          fontSize: 12,
-        ),
-      ),
-      trailing: isSelected
-          ? Icon(
-              Icons.check_circle,
-              color: colorScheme.primary,
-            )
-          : null,
-      onTap: () async {
-        await themeService.setThemeMode(mode);
-        if (context.mounted) {
-          Navigator.pop(context);
-        }
-      },
-    );
   }
 
   IconData _iconForFile(String name) {
@@ -1781,5 +2180,47 @@ class _HomeScreenState extends State<HomeScreen>
     if (['zip', 'rar', '7z'].contains(ext)) return Icons.archive;
     if (['doc', 'docx', 'txt'].contains(ext)) return Icons.description;
     return Icons.insert_drive_file;
+  }
+}
+
+// Animated version of FractionallySizedBox for smooth progress
+class AnimatedFractionallySizedBox extends ImplicitlyAnimatedWidget {
+  final double widthFactor;
+  final Widget child;
+
+  const AnimatedFractionallySizedBox({
+    super.key,
+    required super.duration,
+    required this.widthFactor,
+    required this.child,
+  });
+
+  @override
+  AnimatedFractionallySizedBoxState createState() =>
+      AnimatedFractionallySizedBoxState();
+}
+
+class AnimatedFractionallySizedBoxState
+    extends AnimatedWidgetBaseState<AnimatedFractionallySizedBox> {
+  Tween<double>? _widthTween;
+
+  @override
+  void forEachTween(TweenVisitor<dynamic> visitor) {
+    _widthTween =
+        visitor(
+              _widthTween,
+              widget.widthFactor,
+              (value) => Tween<double>(begin: value as double),
+            )
+            as Tween<double>?;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FractionallySizedBox(
+      alignment: Alignment.centerLeft,
+      widthFactor: _widthTween?.evaluate(animation) ?? widget.widthFactor,
+      child: widget.child,
+    );
   }
 }
