@@ -7,12 +7,14 @@ import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:provider/provider.dart';
 
 import '../../core/network/discovery_service.dart';
 import '../../core/network/http_transfer_service.dart';
 import '../../core/notifications/notification_service.dart';
 import '../../models/device.dart';
 import '../../models/transfer_request.dart';
+import '../../core/theme/theme_service.dart';
 
 class HomeScreen extends StatefulWidget {
   final List<Device> devices;
@@ -149,21 +151,26 @@ class _HomeScreenState extends State<HomeScreen>
         if (sharedFiles != null && sharedFiles.isNotEmpty) {
           final List<File> files = [];
 
-          for (final uri in sharedFiles) {
+          for (final item in sharedFiles) {
             try {
-              final uriString = uri.toString();
-              if (uriString.startsWith('content://')) {
-                debugPrint('URI content:// détecté (non supporté): $uriString');
-                continue;
-              } else {
-                final cleanPath = uriString.replaceFirst('file://', '');
-                final file = File(cleanPath);
+              // The Android native code returns file system paths for shared items
+              // (it copies content:// URIs to cache files). Accept strings directly.
+              if (item is String) {
+                var path = item;
+                if (path.startsWith('file://')) {
+                  path = path.replaceFirst('file://', '');
+                }
+                final file = File(path);
                 if (await file.exists()) {
                   files.add(file);
+                } else {
+                  debugPrint('Shared file path not found: $path');
                 }
+              } else {
+                debugPrint('Unsupported shared item type: ${item.runtimeType}');
               }
             } catch (e) {
-              debugPrint('Erreur traitement URI $uri: $e');
+              debugPrint('Erreur traitement shared item $item: $e');
             }
           }
 
@@ -569,83 +576,145 @@ class _HomeScreenState extends State<HomeScreen>
 
   Widget _buildMobileLayout() {
     final colorScheme = Theme.of(context).colorScheme;
-    return Scaffold(
-      backgroundColor: colorScheme.surface,
-      appBar: AppBar(
-        title: Text(
-          'GoSend',
-          style: GoogleFonts.plusJakartaSans(
-            fontWeight: FontWeight.w700,
-            fontSize: 22,
-          ),
-        ),
-        actions: [
-          AnimatedBuilder(
-            animation: _pulseAnimation,
-            builder: (_, __) => Transform.scale(
-              scale: _pulseAnimation.value,
-              child: IconButton(
-                icon: Icon(
-                  Icons.wifi_tethering,
-                  color: widget.devices.isNotEmpty
-                      ? Colors.green
-                      : Colors.orange,
-                ),
-                onPressed: widget.onRefresh,
-                tooltip: 'Rafraîchir la découverte',
-              ),
+    final isLight = Theme.of(context).brightness == Brightness.light;
+    return AnnotatedRegion<SystemUiOverlayStyle>(
+      value: SystemUiOverlayStyle(
+        statusBarColor: isLight ? Colors.white : const Color(0xFF0F0F0F),
+        statusBarIconBrightness: isLight
+            ? Brightness.dark
+            : Brightness.light,
+        systemNavigationBarColor: colorScheme.surface,
+        systemNavigationBarIconBrightness:
+            isLight
+                ? Brightness.dark
+                : Brightness.light,
+      ),
+      child: Scaffold(
+        backgroundColor: colorScheme.surface,
+        appBar: AppBar(
+          backgroundColor: isLight ? Colors.white : const Color(0xFF0F0F0F),
+          title: Text(
+            'GoSend',
+            style: GoogleFonts.plusJakartaSans(
+              fontWeight: FontWeight.w700,
+              fontSize: 22,
             ),
           ),
-          IconButton(
-            icon: const Icon(Icons.folder_open),
-            tooltip: 'Dossier de réception',
-            onPressed: _openReceiveDirectory,
-          ),
-          PopupMenuButton<String>(
-            icon: const Icon(Icons.more_vert),
-            onSelected: (value) {
-              if (value == 'invisible') {
-                setState(() {
-                  widget.discoveryService.toggleDiscoverability();
-                });
-              }
-            },
-            itemBuilder: (BuildContext context) => [
-              PopupMenuItem(
-                value: 'invisible',
-                child: Row(
-                  children: [
-                    Icon(
-                      widget.discoveryService.isDiscoverable
-                          ? Icons.visibility
-                          : Icons.visibility_off,
-                    ),
-                    const SizedBox(width: 8),
-                    Text(
-                      widget.discoveryService.isDiscoverable
-                          ? 'Rendre invisible'
-                          : 'Rendre visible',
-                    ),
-                  ],
+          actions: [
+            AnimatedBuilder(
+              animation: _pulseAnimation,
+              builder: (_, __) => Transform.scale(
+                scale: _pulseAnimation.value,
+                child: IconButton(
+                  icon: Icon(
+                    Icons.wifi_tethering,
+                    color: widget.devices.isNotEmpty
+                        ? Colors.green
+                        : Colors.orange,
+                  ),
+                  onPressed: widget.onRefresh,
+                  tooltip: 'Rafraîchir la découverte',
                 ),
               ),
+            ),
+            IconButton(
+              icon: const Icon(Icons.folder_open),
+              tooltip: 'Dossier de réception',
+              onPressed: _openReceiveDirectory,
+            ),
+            IconButton(
+              icon: const Icon(Icons.brightness_medium),
+              tooltip: 'Thème',
+              onPressed: () {
+                showDialog(
+                  context: context,
+                  builder: (context) => AlertDialog(
+                    title: const Text('Choisir un thème'),
+                    content: SizedBox(
+                      width: 300,
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          _buildThemeOption(
+                            context,
+                            AppThemeMode.system,
+                            'Système',
+                            'Utilise le thème du système',
+                            Icons.brightness_auto,
+                          ),
+                          _buildThemeOption(
+                            context,
+                            AppThemeMode.light,
+                            'Clair',
+                            'Thème clair',
+                            Icons.wb_sunny,
+                          ),
+                          _buildThemeOption(
+                            context,
+                            AppThemeMode.dark,
+                            'Sombre',
+                            'Thème sombre',
+                            Icons.nightlight_round,
+                          ),
+                        ],
+                      ),
+                    ),
+                    actions: [
+                      TextButton(
+                        onPressed: () => Navigator.pop(context),
+                        child: const Text('Annuler'),
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+            PopupMenuButton<String>(
+              icon: const Icon(Icons.more_vert),
+              onSelected: (value) {
+                if (value == 'invisible') {
+                  setState(() {
+                    widget.discoveryService.toggleDiscoverability();
+                  });
+                }
+              },
+              itemBuilder: (BuildContext context) => [
+                PopupMenuItem(
+                  value: 'invisible',
+                  child: Row(
+                    children: [
+                      Icon(
+                        widget.discoveryService.isDiscoverable
+                            ? Icons.visibility
+                            : Icons.visibility_off,
+                      ),
+                      const SizedBox(width: 8),
+                      Text(
+                        widget.discoveryService.isDiscoverable
+                            ? 'Rendre invisible'
+                            : 'Rendre visible',
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+        body: SingleChildScrollView(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _buildStatusCard(),
+              const SizedBox(height: 16),
+              _buildFilesCard(isMobile: true),
+              const SizedBox(height: 16),
+              _buildDevicesSection(isMobile: true),
+              const SizedBox(height: 16),
+              if (_selectedDevice != null) _buildSendButton(),
             ],
           ),
-        ],
-      ),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            _buildStatusCard(),
-            const SizedBox(height: 16),
-            _buildFilesCard(isMobile: true),
-            const SizedBox(height: 16),
-            _buildDevicesSection(isMobile: true),
-            const SizedBox(height: 16),
-            if (_selectedDevice != null) _buildSendButton(),
-          ],
         ),
       ),
     );
@@ -798,8 +867,88 @@ class _HomeScreenState extends State<HomeScreen>
                       ),
                     ),
                   ),
-                  const SizedBox(height: 12),
                 ],
+  const Divider(height: 1),
+                InkWell(
+                  borderRadius: const BorderRadius.only(
+                    bottomRight: Radius.circular(20),
+                  ),
+                  onTap: () {
+                    showDialog(
+                      context: context,
+                      builder: (context) => AlertDialog(
+                        title: const Text('Choisir un thème'),
+                        content: SizedBox(
+                          width: 300,
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              _buildThemeOption(
+                                context,
+                                AppThemeMode.system,
+                                'Système',
+                                'Utilise le thème du système',
+                                Icons.brightness_auto,
+                              ),
+                              _buildThemeOption(
+                                context,
+                                AppThemeMode.light,
+                                'Clair',
+                                'Thème clair',
+                                Icons.wb_sunny,
+                              ),
+                              _buildThemeOption(
+                                context,
+                                AppThemeMode.dark,
+                                'Sombre',
+                                'Thème sombre',
+                                Icons.nightlight_round,
+                              ),
+                            ],
+                          ),
+                        ),
+                        actions: [
+                          TextButton(
+                            onPressed: () => Navigator.pop(context),
+                            child: const Text('Annuler'),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 20,
+                      vertical: 16,
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(
+                          Icons.brightness_medium,
+                          size: 20,
+                          color: colorScheme.onSurfaceVariant,
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            'Thème',
+                            style: GoogleFonts.plusJakartaSans(
+                              fontSize: 14,
+                              fontWeight: FontWeight.w600,
+                              color: colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                        ),
+                        Icon(
+                          Icons.chevron_right_rounded,
+                          size: 18,
+                          color: colorScheme.onSurfaceVariant,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
               ],
             ),
           ),
@@ -1576,6 +1725,51 @@ class _HomeScreenState extends State<HomeScreen>
     if (lower.contains('ios') || lower.contains('mac')) return Icons.apple;
     if (lower.contains('windows')) return Icons.window;
     return Icons.devices;
+  }
+
+  Widget _buildThemeOption(
+    BuildContext context,
+    AppThemeMode mode,
+    String title,
+    String subtitle,
+    IconData icon,
+  ) {
+    final themeService = context.read<ThemeService>();
+    final isSelected = themeService.themeMode == mode;
+    final colorScheme = Theme.of(context).colorScheme;
+
+    return ListTile(
+      leading: Icon(
+        icon,
+        color: isSelected ? colorScheme.primary : colorScheme.onSurfaceVariant,
+      ),
+      title: Text(
+        title,
+        style: GoogleFonts.plusJakartaSans(
+          fontWeight: isSelected ? FontWeight.w600 : FontWeight.w500,
+          color: isSelected ? colorScheme.primary : colorScheme.onSurface,
+        ),
+      ),
+      subtitle: Text(
+        subtitle,
+        style: TextStyle(
+          color: colorScheme.onSurfaceVariant,
+          fontSize: 12,
+        ),
+      ),
+      trailing: isSelected
+          ? Icon(
+              Icons.check_circle,
+              color: colorScheme.primary,
+            )
+          : null,
+      onTap: () async {
+        await themeService.setThemeMode(mode);
+        if (context.mounted) {
+          Navigator.pop(context);
+        }
+      },
+    );
   }
 
   IconData _iconForFile(String name) {

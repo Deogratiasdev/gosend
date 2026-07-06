@@ -33,6 +33,7 @@ class AppTheme {
     textTheme: _textTheme,
     appBarTheme: AppBarTheme(
       backgroundColor: Colors.white,
+      foregroundColor: Colors.black,
       elevation: 0,
       iconTheme: const IconThemeData(color: Colors.black),
       titleTextStyle: GoogleFonts.plusJakartaSans(

@@ -3,11 +3,13 @@ import 'dart:io';
 
 import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
 import 'package:network_info_plus/network_info_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import 'core/network/discovery_service.dart';
 import 'core/notifications/notification_service.dart';
+import 'core/theme/theme_service.dart';
 import 'models/device.dart';
 import 'ui/screens/home_screen.dart';
 import 'ui/theme.dart';
@@ -162,36 +164,43 @@ class _GoSendAppState extends State<GoSendApp> {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'GoSend',
-      debugShowCheckedModeBanner: false,
-      theme: AppTheme.lightTheme,
-      darkTheme: AppTheme.darkTheme,
-      themeMode: ThemeMode.system,
-      home: _initialized
-          ? HomeScreen(
-              devices: _devices,
-              localDeviceName: _localDeviceName,
-              localIpAddress: _localIpAddress,
-              discoveryService: _discoveryService,
-              onRefresh: () async {
-                // Rafraîchissement manuel : met à jour IP + nom + redémarre découverte
-                final info = await _fetchNetworkInfo();
-                if (mounted) {
-                  setState(() {
-                    _localIpAddress = info.ip;
-                    _localDeviceName = info.name;
-                  });
-                }
-                _discoveryService.updateLocalInfo(
-                  name: info.name,
-                  ipAddress: info.ip,
-                );
-                _discoveryService.stopDiscovery();
-                await _discoveryService.startDiscovery();
-              },
-            )
-          : const Scaffold(body: Center(child: CircularProgressIndicator())),
+    return ChangeNotifierProvider(
+      create: (_) => ThemeService(),
+      child: Consumer<ThemeService>(
+        builder: (context, themeService, child) {
+          return MaterialApp(
+            title: 'GoSend',
+            debugShowCheckedModeBanner: false,
+            theme: AppTheme.lightTheme,
+            darkTheme: AppTheme.darkTheme,
+            themeMode: themeService.materialThemeMode,
+            home: _initialized
+                ? HomeScreen(
+                    devices: _devices,
+                    localDeviceName: _localDeviceName,
+                    localIpAddress: _localIpAddress,
+                    discoveryService: _discoveryService,
+                    onRefresh: () async {
+                      // Rafraîchissement manuel : met à jour IP + nom + redémarre découverte
+                      final info = await _fetchNetworkInfo();
+                      if (mounted) {
+                        setState(() {
+                          _localIpAddress = info.ip;
+                          _localDeviceName = info.name;
+                        });
+                      }
+                      _discoveryService.updateLocalInfo(
+                        name: info.name,
+                        ipAddress: info.ip,
+                      );
+                      _discoveryService.stopDiscovery();
+                      await _discoveryService.startDiscovery();
+                    },
+                  )
+                : const Scaffold(body: Center(child: CircularProgressIndicator())),
+          );
+        },
+      ),
     );
   }
 }
