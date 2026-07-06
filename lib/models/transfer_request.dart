@@ -71,6 +71,34 @@ class FileInfo {
   }
 }
 
+class TextMessage {
+  final String senderName;
+  final String text;
+  final DateTime timestamp;
+
+  TextMessage({
+    required this.senderName,
+    required this.text,
+    required this.timestamp,
+  });
+
+  Map<String, dynamic> toJson() {
+    return {
+      'senderName': senderName,
+      'text': text,
+      'timestamp': timestamp.toIso8601String(),
+    };
+  }
+
+  factory TextMessage.fromJson(Map<String, dynamic> json) {
+    return TextMessage(
+      senderName: json['senderName'] as String,
+      text: json['text'] as String,
+      timestamp: DateTime.parse(json['timestamp'] as String),
+    );
+  }
+}
+
 enum TransferStatus {
   pending,
   accepted,

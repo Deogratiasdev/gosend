@@ -16,6 +16,7 @@ import '../../core/theme/theme_service.dart';
 import '../../models/device.dart';
 import '../../models/transfer_request.dart';
 import '../widgets/custom_title_bar.dart';
+import 'text_message_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   final List<Device> devices;
@@ -78,6 +79,7 @@ class _HomeScreenState extends State<HomeScreen>
     _httpService.onTransferRequestReceived = _handleTransferRequest;
     _httpService.onTransferResponse = _handleTransferResponse;
     _httpService.onControlMessage = _handleControlMessage;
+    _httpService.onTextMessageReceived = _handleTextMessageReceived;
     WidgetsBinding.instance.addObserver(this);
     _deviceSearchController.addListener(() {
       setState(
@@ -402,70 +404,293 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   Future<void> _pickFiles() async {
-    final bool isMobile = MediaQuery.of(context).size.width <= 800;
-    if ((isMobile && Platform.isAndroid) || Platform.isIOS) {
-      final choice = await showModalBottomSheet<String>(
-        context: context,
-        builder: (context) => SafeArea(
+    final result = await FilePicker.platform.pickFiles(allowMultiple: true);
+    if (result != null) {
+      setState(
+        () => _selectedFiles.addAll(
+          result.paths.whereType<String>().map(File.new),
+        ),
+      );
+    }
+  }
+
+  Future<void> _pickPhotos() async {
+    final picker = ImagePicker();
+    final pickedFiles = await picker.pickMultiImage();
+    if (pickedFiles.isNotEmpty) {
+      setState(
+        () => _selectedFiles.addAll(pickedFiles.map((x) => File(x.path))),
+      );
+    }
+  }
+
+  Future<void> _pickVideos() async {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.video,
+      allowMultiple: true,
+    );
+    if (result != null) {
+      setState(
+        () => _selectedFiles.addAll(
+          result.paths.whereType<String>().map(File.new),
+        ),
+      );
+    }
+  }
+
+  // ─────────────── ADD CHOICE (fichiers / texte) ───────────────
+
+  void _showAddMobileSheet() {
+    showModalBottomSheet(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.photo_library),
+              title: const Text('Photos'),
+              onTap: () {
+                Navigator.pop(context);
+                _pickPhotos();
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.videocam),
+              title: const Text('Vidéos'),
+              onTap: () {
+                Navigator.pop(context);
+                _pickVideos();
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.folder),
+              title: const Text('Fichiers'),
+              onTap: () {
+                Navigator.pop(context);
+                _pickFiles();
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.text_snippet_outlined),
+              title: const Text('Texte'),
+              onTap: () {
+                Navigator.pop(context);
+                _showTextInputDialog();
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showAddDesktopMenu(BuildContext context) async {
+    final choice = await showMenu<String>(
+      context: context,
+      position: const RelativeRect.fromLTRB(1000, 200, 0, 0),
+      items: [
+        const PopupMenuItem(
+          value: 'files',
+          child: Row(
+            children: [
+              Icon(Icons.folder_outlined, size: 18),
+              SizedBox(width: 10),
+              Text('Fichiers'),
+            ],
+          ),
+        ),
+        const PopupMenuItem(
+          value: 'text',
+          child: Row(
+            children: [
+              Icon(Icons.text_snippet_outlined, size: 18),
+              SizedBox(width: 10),
+              Text('Texte'),
+            ],
+          ),
+        ),
+      ],
+    );
+    if (choice == 'files') {
+      _pickFiles();
+    } else if (choice == 'text') {
+      _showTextInputDialog();
+    }
+  }
+
+  Future<void> _showTextInputDialog() async {
+    final colorScheme = Theme.of(context).colorScheme;
+    final controller = TextEditingController();
+
+    final text = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Row(
+          children: [
+            Icon(Icons.text_snippet_outlined, size: 20, color: colorScheme.primary),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                'Envoyer du texte',
+                style: GoogleFonts.plusJakartaSans(fontWeight: FontWeight.w700),
+              ),
+            ),
+          ],
+        ),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          minLines: 4,
+          maxLines: 8,
+          decoration: InputDecoration(
+            hintText: 'Tape ton texte ici…',
+            hintStyle: TextStyle(color: colorScheme.onSurfaceVariant),
+            alignLabelWithHint: true,
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: Text(
+              'Annuler',
+              style: TextStyle(color: colorScheme.onSurfaceVariant),
+            ),
+          ),
+          FilledButton.icon(
+            onPressed: () {
+              final value = controller.text.trim();
+              if (value.isNotEmpty) Navigator.pop(context, value);
+            },
+            icon: const Icon(Icons.send_rounded, size: 18),
+            label: const Text('Envoyer'),
+          ),
+        ],
+      ),
+    );
+
+    if (text != null && text.isNotEmpty) {
+      await _sendTextMessage(text);
+    }
+  }
+
+  Future<void> _sendTextMessage(String text) async {
+    if (_selectedDevice == null) {
+      _showSnack('Sélectionne d\'abord un appareil dans la liste');
+      return;
+    }
+    try {
+      _httpService.connectToPeer(
+        _selectedDevice!.ip,
+        httpPort: _selectedDevice!.httpPort,
+      );
+      await _httpService.sendTextMessage(text, widget.localDeviceName);
+      _showSnack('Message envoyé à ${_selectedDevice!.name}');
+    } catch (e) {
+      _showSnack('Erreur: $e');
+    }
+  }
+
+  // ─────────────── RÉCEPTION TEXTE ───────────────
+
+  void _handleTextMessageReceived(String senderName, String text, DateTime timestamp) {
+    final isMobile = MediaQuery.of(context).size.width <= 800;
+    NotificationService().showNotification(
+      title: 'Message de $senderName',
+      body: text.length > 60 ? '${text.substring(0, 60)}…' : text,
+    );
+    if (isMobile) {
+      Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => TextMessageScreen(
+            senderName: senderName,
+            text: text,
+            timestamp: timestamp,
+          ),
+        ),
+      );
+    } else {
+      _showTextMessageDialog(senderName, text, timestamp);
+    }
+  }
+
+  void _showTextMessageDialog(String senderName, String text, DateTime timestamp) {
+    final colorScheme = Theme.of(context).colorScheme;
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Row(
+          children: [
+            Icon(Icons.person, size: 18, color: colorScheme.primary),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Message de $senderName',
+                    style: GoogleFonts.plusJakartaSans(fontWeight: FontWeight.w700),
+                  ),
+                  Text(
+                    '${timestamp.hour.toString().padLeft(2, '0')}:${timestamp.minute.toString().padLeft(2, '0')} — '
+                    '${timestamp.day.toString().padLeft(2, '0')}/${timestamp.month.toString().padLeft(2, '0')}/${timestamp.year}',
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        content: SizedBox(
+          width: double.maxFinite,
           child: Column(
             mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              ListTile(
-                leading: const Icon(Icons.photo_library),
-                title: const Text('Photos'),
-                subtitle: const Text('Picker galerie natif'),
-                onTap: () => Navigator.pop(context, 'photos'),
-              ),
-              ListTile(
-                leading: const Icon(Icons.videocam),
-                title: const Text('Vidéos'),
-                subtitle: const Text('Picker vidéo natif'),
-                onTap: () => Navigator.pop(context, 'videos'),
-              ),
-              ListTile(
-                leading: const Icon(Icons.folder),
-                title: const Text('Fichiers'),
-                subtitle: const Text('Sélecteur de fichiers'),
-                onTap: () => Navigator.pop(context, 'files'),
+              Container(
+                constraints: const BoxConstraints(maxHeight: 320),
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(12),
+                  color: colorScheme.onSurface.withAlpha(6),
+                ),
+                child: SingleChildScrollView(
+                  child: SelectableText(
+                    text,
+                    style: GoogleFonts.plusJakartaSans(
+                      fontSize: 14,
+                      height: 1.5,
+                      color: colorScheme.onSurface,
+                    ),
+                  ),
+                ),
               ),
             ],
           ),
         ),
-      );
-      if (choice == 'photos') {
-        final picker = ImagePicker();
-        final pickedFiles = await picker.pickMultiImage();
-        if (pickedFiles.isNotEmpty) {
-          setState(
-            () => _selectedFiles.addAll(pickedFiles.map((x) => File(x.path))),
-          );
-        }
-      } else if (choice == 'videos') {
-        final picker = ImagePicker();
-        final pickedFile = await picker.pickVideo(source: ImageSource.gallery);
-        if (pickedFile != null) {
-          setState(() => _selectedFiles.add(File(pickedFile.path)));
-        }
-      } else if (choice == 'files') {
-        final result = await FilePicker.platform.pickFiles(allowMultiple: true);
-        if (result != null) {
-          setState(
-            () => _selectedFiles.addAll(
-              result.paths.whereType<String>().map(File.new),
-            ),
-          );
-        }
-      }
-    } else {
-      final result = await FilePicker.platform.pickFiles(allowMultiple: true);
-      if (result != null) {
-        setState(
-          () => _selectedFiles.addAll(
-            result.paths.whereType<String>().map(File.new),
+        actions: [
+          TextButton.icon(
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: text));
+              Navigator.pop(context);
+              _showSnack('Texte copié !');
+            },
+            icon: const Icon(Icons.copy_rounded, size: 18),
+            label: const Text('Copier'),
           ),
-        );
-      }
-    }
+          FilledButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Fermer'),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _sendFiles() async {
@@ -1262,11 +1487,14 @@ class _HomeScreenState extends State<HomeScreen>
             (AppThemeMode.dark, Icons.nightlight_outlined, 'Sombre'),
           ];
           return Dialog(
-            insetPadding: EdgeInsets.zero,
-            alignment: Alignment.bottomLeft,
+            insetPadding: const EdgeInsets.symmetric(
+              horizontal: 40,
+              vertical: 24,
+            ),
+            alignment: Alignment.center,
             backgroundColor: colorScheme.surface,
             shape: const RoundedRectangleBorder(
-              borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+              borderRadius: BorderRadius.all(Radius.circular(20)),
             ),
             child: Padding(
               padding: const EdgeInsets.symmetric(vertical: 12),
@@ -1502,9 +1730,9 @@ class _HomeScreenState extends State<HomeScreen>
                   ),
                 ),
                 FilledButton.icon(
-                  onPressed: _pickFiles,
+                  onPressed: () => isMobile ? _showAddMobileSheet() : _showAddDesktopMenu(context),
                   icon: const Icon(Icons.add, size: 18),
-                  label: Text(isMobile ? 'Ajouter' : 'Ajouter des fichiers'),
+                  label: Text(isMobile ? 'Ajouter' : 'Ajouter'),
                   style: FilledButton.styleFrom(
                     padding: const EdgeInsets.symmetric(
                       horizontal: 16,
@@ -1958,6 +2186,8 @@ class _HomeScreenState extends State<HomeScreen>
             ),
           ),
           const SizedBox(height: 4),
+          _buildSelectionHint(isMobile),
+          const SizedBox(height: 8),
         ],
         if (isMobile)
           filteredDevices.isEmpty
@@ -1970,6 +2200,39 @@ class _HomeScreenState extends State<HomeScreen>
                 : _buildDevicesList(isMobile, filteredDevices),
           ),
       ],
+    );
+  }
+
+  Widget _buildSelectionHint(bool isMobile) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Container(
+      margin: EdgeInsets.symmetric(horizontal: isMobile ? 0 : 16),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(10),
+        color: colorScheme.onSurface.withAlpha(6),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(
+            Icons.info_outline,
+            size: 14,
+            color: colorScheme.onSurfaceVariant,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              'Astuce : sélectionne un appareil ci-dessous, puis appuie sur Envoyer pour transmettre tes fichiers.',
+              style: TextStyle(
+                fontSize: 11,
+                color: colorScheme.onSurfaceVariant,
+                height: 1.3,
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 

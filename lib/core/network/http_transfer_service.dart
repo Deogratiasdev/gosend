@@ -38,6 +38,7 @@ class HttpTransferService {
   Function(String, String)? onControlMessage;
   Function(Uint8List, int)? onChunkReceived;
   Function(String)? onStatusUpdate;
+  Function(String, String, DateTime)? onTextMessageReceived;
 
   HttpTransferService({String? localIpAddress})
     : _localIpAddress = localIpAddress;
@@ -59,7 +60,8 @@ class HttpTransferService {
     final router = Router()
       ..post('/transfer-request', _handleTransferRequest)
       ..post('/transfer-response', _handleTransferResponse)
-      ..post('/control', _handleControl);
+      ..post('/control', _handleControl)
+      ..post('/text-message', _handleTextMessage);
 
     final handler = const Pipeline().addHandler(router.call);
     _signalingServer = await shelf_io.serve(handler, '0.0.0.0', signalingPort);
@@ -359,6 +361,45 @@ class HttpTransferService {
   void dispose() {
     _signalingServer?.close(force: true);
     _transferServer?.close(force: true);
+  }
+
+  Future<Response> _handleTextMessage(Request request) async {
+    final body = await request.readAsString();
+    final data = jsonDecode(body) as Map<String, dynamic>;
+    final senderName = data['senderName'] as String;
+    final text = data['text'] as String;
+    final timestamp = DateTime.parse(data['timestamp'] as String);
+
+    final connectionInfo =
+        request.context['shelf.io.connection_info'] as HttpConnectionInfo?;
+    final requestIp = connectionInfo?.remoteAddress.address;
+    if (requestIp != null && requestIp.isNotEmpty && requestIp != 'Non disponible') {
+      _currentPeerIp = requestIp;
+      debugPrint('💬 Message texte reçu de $senderName ($requestIp)');
+    }
+
+    onTextMessageReceived?.call(senderName, text, timestamp);
+    return Response.ok('OK');
+  }
+
+  Future<void> sendTextMessage(String text, String senderName) async {
+    final peerIp = _currentPeerIp;
+    if (peerIp == null) throw Exception('Pas de peer connecté');
+
+    final uri = Uri.parse('http://$peerIp:$signalingPort/text-message');
+    final response = await http
+        .post(
+          uri,
+          headers: {'content-type': 'application/json'},
+          body: jsonEncode({
+            'senderName': senderName,
+            'text': text,
+            'timestamp': DateTime.now().toIso8601String(),
+          }),
+        )
+        .timeout(const Duration(seconds: 10));
+
+    _throwForBadStatus(response.statusCode, uri, 'Message texte non envoyé');
   }
 
   void _throwForBadStatus(int statusCode, Uri uri, String message) {
