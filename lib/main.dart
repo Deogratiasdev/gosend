@@ -3,9 +3,9 @@ import 'dart:io';
 
 import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
 import 'package:network_info_plus/network_info_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:provider/provider.dart';
 import 'package:window_manager/window_manager.dart';
 
 import 'core/network/discovery_service.dart';
@@ -22,7 +22,7 @@ void main() async {
   if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) {
     await windowManager.ensureInitialized();
 
-    WindowOptions windowOptions = const WindowOptions(
+    const WindowOptions windowOptions = WindowOptions(
       size: Size(1100, 720),
       minimumSize: Size(800, 550),
       center: true,

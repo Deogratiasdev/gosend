@@ -52,7 +52,7 @@ class _HomeScreenState extends State<HomeScreen>
   late Animation<double> _pulseAnimation;
   late final HttpTransferService _httpService;
   final List<TransferRequest> _incomingRequests = [];
-  TransferRequest? _currentReceivingRequest;
+
   String? _currentTransferId;
   bool _isPaused = false;
   final TextEditingController _deviceSearchController = TextEditingController();
@@ -175,8 +175,9 @@ class _HomeScreenState extends State<HomeScreen>
             try {
               if (item is String) {
                 var path = item;
-                if (path.startsWith('file://'))
+                if (path.startsWith('file://')) {
                   path = path.replaceFirst('file://', '');
+                }
                 final file = File(path);
                 if (await file.exists()) {
                   files.add(file);
@@ -221,12 +222,21 @@ class _HomeScreenState extends State<HomeScreen>
   void _handleTransferResponse(String requestId, bool accepted) {
     if (accepted) {
       _currentTransferId = requestId;
+      _showStatusBanner(
+        '✅ Demande acceptée — transfert en cours…',
+        type: 'success',
+      );
       _startFileTransfer();
     } else {
       setState(() {
         _statusMessage = 'Transfert refusé';
+        _isConnecting = false;
         _isTransferring = false;
       });
+      _showStatusBanner(
+        '❌ Demande refusée par l\'appareil distant',
+        type: 'error',
+      );
     }
   }
 
@@ -241,7 +251,6 @@ class _HomeScreenState extends State<HomeScreen>
       setState(() {
         _isTransferring = false;
         _statusMessage = 'Transfert annulé par l\'autre appareil';
-        _currentReceivingRequest = null;
       });
       _httpService.cancelTransfer();
     }
@@ -267,7 +276,6 @@ class _HomeScreenState extends State<HomeScreen>
     setState(() {
       _isTransferring = false;
       _statusMessage = 'Transfert annulé';
-      _currentReceivingRequest = null;
     });
     _httpService.cancelTransfer();
     if (_currentTransferId != null) {
@@ -346,7 +354,6 @@ class _HomeScreenState extends State<HomeScreen>
                 saveDir,
                 (fileIndex, received, total) {
                   setState(() {
-                    _currentReceivingRequest = request;
                     _totalBytesToReceive = total;
                     _isTransferring = true;
                     _progress = total > 0 ? received / total : 0.0;
@@ -369,7 +376,7 @@ class _HomeScreenState extends State<HomeScreen>
                     _isTransferring = false;
                     _progress = 0.0;
                     _statusMessage = 'Transfert terminé !';
-                    _currentReceivingRequest = null;
+                    _fileProgress.clear();
                   });
                   _showSnack('Tous les fichiers enregistrés !');
                   NotificationService().showNotification(
@@ -381,7 +388,6 @@ class _HomeScreenState extends State<HomeScreen>
               await _httpService.sendTransferResponse(request.id, true);
               setState(() {
                 _incomingRequests.remove(request);
-                _currentReceivingRequest = request;
                 _totalBytesToReceive = totalSize;
                 _isPaused = false;
                 _isTransferring = true;
@@ -503,6 +509,10 @@ class _HomeScreenState extends State<HomeScreen>
       );
       await _httpService.sendTransferRequest(request);
       _currentTransferId = request.id;
+      _showStatusBanner(
+        '⏳ Demande envoyée à ${_selectedDevice!.name}…',
+        type: 'pending',
+      );
     } catch (e) {
       setState(() {
         _isConnecting = false;
@@ -524,6 +534,7 @@ class _HomeScreenState extends State<HomeScreen>
         _currentTransferId!,
         (totalSent, totalSize) {
           setState(() {
+            _totalBytesToReceive = totalSize;
             _progress = totalSize > 0 ? totalSent / totalSize : 0.0;
             _statusMessage = 'Envoi en cours...';
           });
@@ -534,8 +545,14 @@ class _HomeScreenState extends State<HomeScreen>
             _progress = 1.0;
             _statusMessage = 'Envoi terminé !';
             _currentTransferId = null;
+            _fileProgress.clear();
           });
           _showSnack('Fichiers envoyés avec succès !');
+        },
+        onFileProgress: (fileIndex, fileSent, fileSize) {
+          setState(() {
+            _fileProgress[fileIndex] = fileSize > 0 ? fileSent / fileSize : 0.0;
+          });
         },
       );
     } catch (e) {
@@ -602,6 +619,112 @@ class _HomeScreenState extends State<HomeScreen>
     );
     Overlay.of(context).insert(entry!);
     Future.delayed(const Duration(seconds: 4), () {
+      if (entry != null && entry!.mounted) {
+        entry!.remove();
+        entry = null;
+      }
+    });
+  }
+
+  /// Affiche un banner non-bloquant stylisé pour les statuts de transfert.
+  /// [type]: 'pending' | 'success' | 'error'
+  void _showStatusBanner(String message, {String type = 'pending'}) {
+    OverlayEntry? entry;
+
+    final colors = switch (type) {
+      'success' => (
+          const Color(0xFF1A7A4A),
+          const Color(0xFFDCF5E9),
+          Icons.check_circle_outline_rounded
+        ),
+      'error' => (
+          const Color(0xFF9B2525),
+          const Color(0xFFFFEBEB),
+          Icons.cancel_outlined
+        ),
+      _ => (
+          const Color(0xFF2A4B8A),
+          const Color(0xFFE8EEFF),
+          Icons.schedule_rounded
+        ),
+    };
+    final (darkBg, lightBg, icon) = colors;
+
+    entry = OverlayEntry(
+      builder: (ctx) {
+        final isDark = Theme.of(ctx).brightness == Brightness.dark;
+        final bg = isDark ? darkBg : lightBg;
+        final textColor = isDark ? Colors.white : darkBg;
+        return Positioned(
+          top: 60,
+          left: 24,
+          right: 24,
+          child: Material(
+            color: Colors.transparent,
+            child: Align(
+              alignment: Alignment.topCenter,
+              child: GestureDetector(
+                onTap: () {
+                  entry?.remove();
+                  entry = null;
+                },
+                child: TweenAnimationBuilder<double>(
+                  tween: Tween(begin: 0.0, end: 1.0),
+                  duration: const Duration(milliseconds: 300),
+                  curve: Curves.easeOutBack,
+                  builder: (_, v, child) =>
+                      Opacity(opacity: v.clamp(0.0, 1.0), child: Transform.translate(offset: Offset(0, -10 * (1 - v)), child: child)),
+                  child: Container(
+                    constraints: const BoxConstraints(maxWidth: 420),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 12,
+                    ),
+                    decoration: BoxDecoration(
+                      color: bg,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(
+                        color: darkBg.withAlpha(isDark ? 60 : 80),
+                        width: 1,
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: darkBg.withAlpha(isDark ? 40 : 25),
+                          blurRadius: 12,
+                          offset: const Offset(0, 4),
+                        ),
+                      ],
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(icon, size: 18, color: textColor),
+                        const SizedBox(width: 10),
+                        Flexible(
+                          child: Text(
+                            message,
+                            style: TextStyle(
+                              color: textColor,
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600,
+                            ),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+
+    Overlay.of(context).insert(entry!);
+    Future.delayed(const Duration(seconds: 3), () {
       if (entry != null && entry!.mounted) {
         entry!.remove();
         entry = null;
@@ -737,74 +860,105 @@ class _HomeScreenState extends State<HomeScreen>
           // ── Sidebar ──
           Container(
             width: 300,
+            margin: const EdgeInsets.fromLTRB(16, 16, 8, 16),
             decoration: BoxDecoration(
               color: colorScheme.surface,
-              border: Border(
-                right: BorderSide(color: colorScheme.outlineVariant),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(
+                color: colorScheme.outlineVariant.withAlpha(50),
               ),
             ),
             child: Column(
               children: [
-                const SizedBox(height: 32),
-                // Logo / Brand
+                const SizedBox(height: 16),
+                // Logo / Brand Card
                 Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 24),
-                  child: Row(
-                    children: [
-                      Text(
-                        'GoSend',
-                        style: GoogleFonts.plusJakartaSans(
-                          fontSize: 24,
-                          fontWeight: FontWeight.w800,
-                          color: colorScheme.onSurface,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 6),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 24),
-                  child: Row(
-                    children: [
-                      const SizedBox(width: 54),
-                      AnimatedBuilder(
-                        animation: _pulseAnimation,
-                        builder: (_, __) => Transform.scale(
-                          scale: _pulseAnimation.value,
-                          child: Container(
-                            width: 7,
-                            height: 7,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              color: colorScheme.onSurface,
-                            ),
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 14,
+                    ),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(16),
+                      color: colorScheme.surface,
+                    ),
+                    child: Row(
+                      children: [
+                        Container(
+                          width: 40,
+                          height: 40,
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(12),
+                            color: colorScheme.onSurface.withAlpha(10),
+                          ),
+                          child: Icon(
+                            Icons.send_rounded,
+                            color: colorScheme.onSurface,
+                            size: 20,
                           ),
                         ),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          widget.localDeviceName,
-                          style: TextStyle(
-                            color: colorScheme.onSurfaceVariant,
-                            fontSize: 12,
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                'GoSend',
+                                style: GoogleFonts.plusJakartaSans(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w800,
+                                  color: colorScheme.onSurface,
+                                  letterSpacing: -0.5,
+                                ),
+                              ),
+                              const SizedBox(height: 3),
+                              Row(
+                                children: [
+                                  AnimatedBuilder(
+                                    animation: _pulseAnimation,
+                                    builder: (_, __) => Transform.scale(
+                                      scale: _pulseAnimation.value,
+                                      child: Container(
+                                        width: 6,
+                                        height: 6,
+                                        decoration: const BoxDecoration(
+                                          shape: BoxShape.circle,
+                                          color: Colors.green,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 6),
+                                  Expanded(
+                                    child: Text(
+                                      widget.localDeviceName,
+                                      style: TextStyle(
+                                        color: colorScheme.onSurfaceVariant,
+                                        fontSize: 11,
+                                        fontWeight: FontWeight.w500,
+                                      ),
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ],
                           ),
-                          overflow: TextOverflow.ellipsis,
                         ),
-                      ),
-                    ],
+                      ],
+                    ),
                   ),
                 ),
-                const SizedBox(height: 28),
+                const SizedBox(height: 20),
                 Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 24),
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
                   child: _buildSearchField(),
                 ),
                 const SizedBox(height: 20),
                 // Status pill
                 Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 24),
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
                   child: Container(
                     padding: const EdgeInsets.symmetric(
                       horizontal: 12,
@@ -888,10 +1042,12 @@ class _HomeScreenState extends State<HomeScreen>
           // ── Main Content ──
           Expanded(
             child: Container(
+              margin: const EdgeInsets.fromLTRB(8, 16, 16, 16),
               decoration: BoxDecoration(
                 color: colorScheme.surfaceContainerLow,
-                borderRadius: const BorderRadius.only(
-                  topLeft: Radius.circular(20),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(
+                  color: colorScheme.outlineVariant.withAlpha(50),
                 ),
               ),
               child: Column(
@@ -1092,184 +1248,91 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   void _showThemeDesktopDialog(BuildContext context) {
-    final colorScheme = Theme.of(context).colorScheme;
     final themeService = context.read<ThemeService>();
 
     showDialog(
       context: context,
-      builder: (context) => Dialog(
-        backgroundColor: colorScheme.surface,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        child: Container(
-          width: 380,
-          padding: const EdgeInsets.all(28),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  Container(
-                    width: 40,
-                    height: 40,
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(10),
-                      color: colorScheme.onSurface.withAlpha(10),
-                    ),
-                    child: Icon(
-                      Icons.palette_outlined,
-                      color: colorScheme.onSurface,
-                      size: 20,
-                    ),
-                  ),
-                  const SizedBox(width: 14),
-                  Text(
-                    'Apparence',
-                    style: GoogleFonts.plusJakartaSans(
-                      fontSize: 20,
-                      fontWeight: FontWeight.w800,
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 8),
-              Text(
-                'Choisis comment GoSend s\'affiche.',
-                style: TextStyle(
-                  fontSize: 13,
-                  color: colorScheme.onSurfaceVariant,
-                ),
-              ),
-              const SizedBox(height: 24),
-              _buildThemeTile(
-                context,
-                themeService,
-                AppThemeMode.system,
-                'Système',
-                'Utilise le thème du système',
-                Icons.brightness_auto,
-              ),
-              const SizedBox(height: 8),
-              _buildThemeTile(
-                context,
-                themeService,
-                AppThemeMode.light,
-                'Clair',
-                'Fond clair et texte sombre',
-                Icons.wb_sunny,
-              ),
-              const SizedBox(height: 8),
-              _buildThemeTile(
-                context,
-                themeService,
-                AppThemeMode.dark,
-                'Sombre',
-                'Fond sombre et texte clair',
-                Icons.nightlight_round,
-              ),
-              const SizedBox(height: 24),
-              Align(
-                alignment: Alignment.centerRight,
-                child: TextButton(
-                  onPressed: () => Navigator.pop(context),
-                  child: Text(
-                    'Fermer',
-                    style: TextStyle(color: colorScheme.onSurfaceVariant),
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildThemeTile(
-    BuildContext context,
-    ThemeService themeService,
-    AppThemeMode mode,
-    String title,
-    String subtitle,
-    IconData icon,
-  ) {
-    final colorScheme = Theme.of(context).colorScheme;
-    final isSelected = themeService.themeMode == mode;
-
-    return InkWell(
-      onTap: () async {
-        await themeService.setThemeMode(mode);
-        if (context.mounted) Navigator.pop(context);
-      },
-      borderRadius: BorderRadius.circular(12),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(12),
-          color: isSelected ? colorScheme.onSurface.withAlpha(8) : null,
-          border: Border.all(
-            color: isSelected
-                ? colorScheme.onSurface
-                : colorScheme.outlineVariant,
-            width: isSelected ? 1.5 : 1,
-          ),
-        ),
-        child: Row(
-          children: [
-            Container(
-              width: 40,
-              height: 40,
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(10),
-                color: colorScheme.onSurface.withAlpha(10),
-              ),
-              child: Icon(
-                icon,
-                size: 20,
-                color: isSelected
-                    ? colorScheme.onSurface
-                    : colorScheme.onSurfaceVariant,
-              ),
+      barrierColor: Colors.black26,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setInner) {
+          final colorScheme = Theme.of(ctx).colorScheme;
+          final modes = [
+            (AppThemeMode.system, Icons.brightness_auto, 'Système'),
+            (AppThemeMode.light, Icons.wb_sunny_outlined, 'Clair'),
+            (AppThemeMode.dark, Icons.nightlight_outlined, 'Sombre'),
+          ];
+          return Dialog(
+            insetPadding: EdgeInsets.zero,
+            alignment: Alignment.bottomLeft,
+            backgroundColor: colorScheme.surface,
+            shape: const RoundedRectangleBorder(
+              borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
             ),
-            const SizedBox(width: 14),
-            Expanded(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 12),
               child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  Text(
-                    title,
-                    style: GoogleFonts.plusJakartaSans(
-                      fontSize: 14,
-                      fontWeight: FontWeight.w700,
-                      color: colorScheme.onSurface,
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 8, 20, 12),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.palette_outlined, size: 18),
+                        const SizedBox(width: 10),
+                        Text(
+                          'Apparence',
+                          style: GoogleFonts.plusJakartaSans(
+                            fontSize: 15,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ],
                     ),
                   ),
-                  const SizedBox(height: 2),
-                  Text(
-                    subtitle,
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: colorScheme.onSurfaceVariant,
-                    ),
-                  ),
+                  const Divider(height: 1),
+                  ...modes.map((item) {
+                    final (mode, icon, label) = item;
+                    final selected = themeService.themeMode == mode;
+                    return ListTile(
+                      leading: Icon(
+                        icon,
+                        color: selected
+                            ? colorScheme.primary
+                            : colorScheme.onSurfaceVariant,
+                      ),
+                      title: Text(
+                        label,
+                        style: GoogleFonts.plusJakartaSans(
+                          fontSize: 14,
+                          fontWeight: selected
+                              ? FontWeight.w600
+                              : FontWeight.w400,
+                          color: selected
+                              ? colorScheme.primary
+                              : colorScheme.onSurface,
+                        ),
+                      ),
+                      trailing: selected
+                          ? Icon(Icons.check_rounded,
+                              size: 18, color: colorScheme.primary)
+                          : null,
+                      onTap: () async {
+                        await themeService.setThemeMode(mode);
+                        setInner(() {});
+                        if (ctx.mounted) Navigator.pop(ctx);
+                      },
+                    );
+                  }),
+                  const SizedBox(height: 4),
                 ],
               ),
             ),
-            if (isSelected)
-              Container(
-                width: 22,
-                height: 22,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: colorScheme.onSurface,
-                ),
-                child: Icon(Icons.check, size: 14, color: colorScheme.surface),
-              ),
-          ],
-        ),
+          );
+        },
       ),
     );
   }
+
 
   // ─────────────── STATUS CARD (Mobile) ───────────────
 
@@ -1933,7 +1996,7 @@ class _HomeScreenState extends State<HomeScreen>
               color: colorScheme.onSurface.withAlpha(10),
             ),
             child: Icon(
-              Icons.computer,
+              _iconForOs(Platform.operatingSystem),
               size: isMobile ? 16 : 18,
               color: colorScheme.onSurface,
             ),
@@ -1967,13 +2030,19 @@ class _HomeScreenState extends State<HomeScreen>
             ),
           ),
           Container(
-            width: 24,
-            height: 24,
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
             decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              color: colorScheme.onSurface.withAlpha(15),
+              borderRadius: BorderRadius.circular(8),
+              color: colorScheme.primary.withAlpha(15),
             ),
-            child: Icon(Icons.check, size: 14, color: colorScheme.onSurface),
+            child: Text(
+              'Moi',
+              style: TextStyle(
+                fontSize: 10,
+                fontWeight: FontWeight.bold,
+                color: colorScheme.primary,
+              ),
+            ),
           ),
         ],
       ),
@@ -2151,8 +2220,9 @@ class _HomeScreenState extends State<HomeScreen>
   String _formatSize(int bytes) {
     if (bytes < 1024) return '$bytes B';
     if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
-    if (bytes < 1024 * 1024 * 1024)
+    if (bytes < 1024 * 1024 * 1024) {
       return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
     return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
   }
 

@@ -111,7 +111,8 @@ class HttpTransferService {
 
     final fileInfo = _currentFiles![fileIndex];
     final fileName = _safeFileName(fileInfo.name);
-    final filePath = '$_currentSaveDir/$fileName';
+    final subfolder = _getSubfolderForFile(fileName);
+    final filePath = '$_currentSaveDir/$subfolder/$fileName';
     final file = File(filePath);
     await file.parent.create(recursive: true);
 
@@ -285,8 +286,9 @@ class HttpTransferService {
     List<File> files,
     String transferId,
     Function(int totalSent, int totalSize) onProgress,
-    Function() onComplete,
-  ) async {
+    Function() onComplete, {
+    Function(int fileIndex, int fileSent, int fileSize)? onFileProgress,
+  }) async {
     if (_currentPeerIp == null) throw Exception('Pas de peer connecté');
 
     int totalSize = 0;
@@ -311,6 +313,7 @@ class HttpTransferService {
         final raf = await file.open();
         try {
           int offset = 0;
+          onFileProgress?.call(i, 0, fileSize);
           while (offset < fileSize) {
             final remaining = fileSize - offset;
             final toRead = chunkSize < remaining ? chunkSize : remaining;
@@ -320,6 +323,7 @@ class HttpTransferService {
             offset += bytes.length;
             totalSent += bytes.length;
             onProgress(totalSent, totalSize);
+            onFileProgress?.call(i, offset, fileSize);
           }
         } finally {
           await raf.close();
@@ -372,5 +376,28 @@ class HttpTransferService {
     if (ip == null || ip.isEmpty || ip == 'Non disponible') return null;
     if (ip == '0.0.0.0' || ip == '::') return null;
     return ip;
+  }
+
+  String _getSubfolderForFile(String name) {
+    final dotIndex = name.lastIndexOf('.');
+    if (dotIndex == -1 || dotIndex == name.length - 1) {
+      return 'files';
+    }
+    final ext = name.substring(dotIndex + 1).toLowerCase();
+
+    // photos
+    if (const ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'tiff', 'svg', 'heic', 'heif'].contains(ext)) {
+      return 'photos';
+    }
+    // videos
+    if (const ['mp4', 'mkv', 'avi', 'mov', 'webm', 'flv', 'wmv', '3gp'].contains(ext)) {
+      return 'videos';
+    }
+    // sounds
+    if (const ['mp3', 'wav', 'flac', 'aac', 'ogg', 'm4a', 'wma'].contains(ext)) {
+      return 'sounds';
+    }
+
+    return 'files';
   }
 }

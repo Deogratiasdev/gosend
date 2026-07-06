@@ -144,9 +144,9 @@ class AppTheme {
       color: _lightSurface,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
     ),
-    bottomSheetTheme: BottomSheetThemeData(
+    bottomSheetTheme: const BottomSheetThemeData(
       backgroundColor: _lightSurface,
-      shape: const RoundedRectangleBorder(
+      shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
     ),
@@ -256,9 +256,9 @@ class AppTheme {
       color: _darkSurface,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
     ),
-    bottomSheetTheme: BottomSheetThemeData(
+    bottomSheetTheme: const BottomSheetThemeData(
       backgroundColor: _darkSurface,
-      shape: const RoundedRectangleBorder(
+      shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
     ),

@@ -83,7 +83,7 @@ class CustomTitleBar extends StatelessWidget {
             _WindowButton(
               icon: Icons.close,
               hoverColor: closeHover,
-              iconColor: Colors.white,
+              iconColor: iconColor,
               onTap: () => windowManager.close(),
             ),
           ],
@@ -125,7 +125,13 @@ class _WindowButtonState extends State<_WindowButton> {
           height: 40,
           color: _isHovered ? widget.hoverColor : Colors.transparent,
           child: Center(
-            child: Icon(widget.icon, size: 16, color: widget.iconColor),
+            child: Icon(
+              widget.icon,
+              size: 16,
+              color: _isHovered && widget.icon == Icons.close
+                  ? Colors.white
+                  : widget.iconColor,
+            ),
           ),
         ),
       ),
