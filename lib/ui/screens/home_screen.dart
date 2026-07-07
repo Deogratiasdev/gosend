@@ -9,6 +9,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/audio/audio_service.dart';
 import '../../core/network/discovery_service.dart';
 import '../../core/network/http_transfer_service.dart';
 import '../../core/network/network_util.dart';
@@ -402,6 +403,7 @@ class _HomeScreenState extends State<HomeScreen>
                     _statusMessage = 'Transfert terminé !';
                     _fileProgress.clear();
                   });
+                  AudioService.instance.playFileReceived();
                   _notify('Tous les fichiers enregistrés !', icon: Icons.check_circle_outline_rounded);
                   NotificationService().showNotification(
                     title: 'Transfert terminé',
@@ -427,12 +429,13 @@ class _HomeScreenState extends State<HomeScreen>
 
   Future<void> _pickFiles() async {
     final result = await FilePicker.platform.pickFiles(allowMultiple: true);
-    if (result != null) {
+    if (result != null && result.paths.isNotEmpty) {
       setState(
         () => _selectedFiles.addAll(
           result.paths.whereType<String>().map(File.new),
         ),
       );
+      AudioService.instance.playFileAdded();
     }
   }
 
@@ -443,6 +446,7 @@ class _HomeScreenState extends State<HomeScreen>
       setState(
         () => _selectedFiles.addAll(pickedFiles.map((x) => File(x.path))),
       );
+      AudioService.instance.playFileAdded();
     }
   }
 
@@ -451,12 +455,13 @@ class _HomeScreenState extends State<HomeScreen>
       type: FileType.video,
       allowMultiple: true,
     );
-    if (result != null) {
+    if (result != null && result.paths.isNotEmpty) {
       setState(
         () => _selectedFiles.addAll(
           result.paths.whereType<String>().map(File.new),
         ),
       );
+      AudioService.instance.playFileAdded();
     }
   }
 
@@ -924,6 +929,7 @@ class _HomeScreenState extends State<HomeScreen>
             _currentTransferId = null;
             _fileProgress.clear();
           });
+          AudioService.instance.playFileReceived();
           _notify('Fichiers envoyés avec succès !', icon: Icons.check_circle_outline_rounded);
         },
         onFileProgress: (fileIndex, fileSent, fileSize) {
@@ -1594,22 +1600,59 @@ class _HomeScreenState extends State<HomeScreen>
                     ],
                   ),
                   const SizedBox(height: 6),
-                  SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(6),
+                      color: colorScheme.onSurface.withAlpha(8),
+                    ),
                     child: Text(
                       _receiveDirectoryPath!,
                       style: TextStyle(
                         fontSize: 10,
-                        color: colorScheme.onSurfaceVariant.withAlpha(120),
+                        color: colorScheme.onSurfaceVariant,
                         fontFamily: 'monospace',
                       ),
-                      maxLines: 1,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
                     ),
                   ),
                 ],
               ),
             ),
           ),
+        const Divider(height: 1),
+        InkWell(
+          onTap: () => _showAbout(),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
+            child: Row(
+              children: [
+                Icon(
+                  Icons.person_outline,
+                  size: 18,
+                  color: colorScheme.onSurfaceVariant,
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    'À propos',
+                    style: GoogleFonts.plusJakartaSans(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500,
+                      color: colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+                Icon(
+                  Icons.chevron_right_rounded,
+                  size: 16,
+                  color: colorScheme.onSurfaceVariant,
+                ),
+              ],
+            ),
+          ),
+        ),
         const Divider(height: 1),
         InkWell(
           onTap: () => _showThemeDialog(context),
@@ -1986,6 +2029,9 @@ class _HomeScreenState extends State<HomeScreen>
           _selectedFiles.addAll(details.files.map((f) => File(f.path)));
           _isDragging = false;
         });
+        if (details.files.isNotEmpty) {
+          AudioService.instance.playFileAdded();
+        }
       },
       onDragEntered: (_) => setState(() => _isDragging = true),
       onDragExited: (_) => setState(() => _isDragging = false),
@@ -2560,12 +2606,12 @@ class _HomeScreenState extends State<HomeScreen>
             height: 36,
             decoration: BoxDecoration(
               shape: BoxShape.circle,
-              color: colorScheme.onSurface.withAlpha(10),
+              color: colorScheme.primary.withAlpha(20),
             ),
             child: Icon(
               _iconForOs(Platform.operatingSystem),
               size: isMobile ? 16 : 18,
-              color: colorScheme.onSurface,
+              color: colorScheme.primary,
             ),
           ),
           const SizedBox(width: 12),
@@ -2578,36 +2624,67 @@ class _HomeScreenState extends State<HomeScreen>
                   widget.localDeviceName,
                   style: GoogleFonts.plusJakartaSans(
                     fontSize: isMobile ? 13 : 12,
-                    fontWeight: FontWeight.w600,
+                    fontWeight: FontWeight.w700,
                     color: colorScheme.onSurface,
                   ),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),
-                Text(
-                  widget.localIpAddress,
-                  style: GoogleFonts.inter(
-                    fontSize: isMobile ? 11 : 11,
-                    color: colorScheme.onSurfaceVariant,
+                const SizedBox(height: 2),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(4),
+                    color: colorScheme.onSurface.withAlpha(8),
                   ),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
+                  child: Text(
+                    widget.localIpAddress,
+                    style: GoogleFonts.jetBrainsMono(
+                      fontSize: isMobile ? 11 : 10,
+                      color: colorScheme.onSurfaceVariant,
+                      fontWeight: FontWeight.w500,
+                    ),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
                 ),
-                Text(
-                  'ID: ${widget.localDeviceId.length >= 8 ? widget.localDeviceId.substring(0, 8) : widget.localDeviceId}',
-                  style: TextStyle(
-                    color: colorScheme.onSurfaceVariant.withAlpha(120),
-                    fontSize: 10,
-                    fontFamily: 'monospace',
+                const SizedBox(height: 4),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(4),
+                    color: colorScheme.primary.withAlpha(12),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        Icons.fingerprint,
+                        size: 10,
+                        color: colorScheme.primary,
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        widget.localDeviceId.length >= 8 
+                            ? widget.localDeviceId.substring(0, 8).toUpperCase()
+                            : widget.localDeviceId.toUpperCase(),
+                        style: GoogleFonts.jetBrainsMono(
+                          fontSize: 9,
+                          fontWeight: FontWeight.w600,
+                          color: colorScheme.primary,
+                          letterSpacing: 0.5,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ],
             ),
           ),
           Container(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
             decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(8),
+              borderRadius: BorderRadius.circular(10),
               color: colorScheme.primary.withAlpha(15),
             ),
             child: Text(
@@ -2679,11 +2756,11 @@ class _HomeScreenState extends State<HomeScreen>
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(14),
             color: isSelected
-                ? colorScheme.onSurface.withAlpha(10)
+                ? colorScheme.primary.withAlpha(10)
                 : colorScheme.surface,
             border: Border.all(
               color: isSelected
-                  ? colorScheme.onSurface
+                  ? colorScheme.primary
                   : colorScheme.outlineVariant.withAlpha(60),
               width: isSelected ? 2 : 1,
             ),
@@ -2695,12 +2772,14 @@ class _HomeScreenState extends State<HomeScreen>
                 height: 40,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
-                  color: colorScheme.onSurface.withAlpha(10),
+                  color: isSelected 
+                      ? colorScheme.primary.withAlpha(25)
+                      : colorScheme.onSurface.withAlpha(10),
                 ),
                 child: Icon(
                   _iconForOs(device.os),
                   size: 20,
-                  color: colorScheme.onSurface,
+                  color: isSelected ? colorScheme.primary : colorScheme.onSurface,
                 ),
               ),
               const SizedBox(width: 12),
@@ -2717,19 +2796,50 @@ class _HomeScreenState extends State<HomeScreen>
                       ),
                       overflow: TextOverflow.ellipsis,
                     ),
-                    Text(
-                      device.ip,
-                      style: TextStyle(
-                        color: colorScheme.onSurfaceVariant,
-                        fontSize: 11,
+                    const SizedBox(height: 4),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(5),
+                        color: colorScheme.onSurface.withAlpha(8),
+                      ),
+                      child: Text(
+                        device.ip,
+                        style: GoogleFonts.jetBrainsMono(
+                          color: colorScheme.onSurfaceVariant,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w500,
+                        ),
                       ),
                     ),
-                    Text(
-                      'ID: ${device.id.length >= 8 ? device.id.substring(0, 8) : device.id}',
-                      style: TextStyle(
-                        color: colorScheme.onSurfaceVariant.withAlpha(120),
-                        fontSize: 10,
-                        fontFamily: 'monospace',
+                    const SizedBox(height: 4),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(4),
+                        color: colorScheme.primary.withAlpha(12),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.fingerprint,
+                            size: 9,
+                            color: colorScheme.primary,
+                          ),
+                          const SizedBox(width: 4),
+                          Text(
+                            device.id.length >= 8 
+                                ? device.id.substring(0, 8).toUpperCase()
+                                : device.id.toUpperCase(),
+                            style: GoogleFonts.jetBrainsMono(
+                              color: colorScheme.primary,
+                              fontSize: 9,
+                              fontWeight: FontWeight.w600,
+                              letterSpacing: 0.5,
+                            ),
+                          ),
+                        ],
                       ),
                     ),
                   ],
@@ -2737,16 +2847,16 @@ class _HomeScreenState extends State<HomeScreen>
               ),
               if (isSelected)
                 Container(
-                  width: 22,
-                  height: 22,
+                  width: 24,
+                  height: 24,
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
-                    color: colorScheme.onSurface,
+                    color: colorScheme.primary,
                   ),
                   child: Icon(
                     Icons.check,
-                    size: 14,
-                    color: colorScheme.surface,
+                    size: 16,
+                    color: colorScheme.onPrimary,
                   ),
                 ),
             ],
@@ -2826,12 +2936,53 @@ class _HomeScreenState extends State<HomeScreen>
 
   IconData _iconForFile(String name) {
     final ext = name.split('.').last.toLowerCase();
-    if (['jpg', 'jpeg', 'png', 'gif', 'webp'].contains(ext)) return Icons.image;
-    if (['mp4', 'avi', 'mov', 'mkv'].contains(ext)) return Icons.movie;
-    if (['mp3', 'wav', 'flac', 'aac'].contains(ext)) return Icons.music_note;
+    
+    // Images
+    if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg', 'ico', 'tiff', 'heic', 'heif'].contains(ext)) {
+      return Icons.image;
+    }
+    
+    // Videos
+    if (['mp4', 'avi', 'mov', 'mkv', 'wmv', 'flv', 'webm', 'm4v', '3gp'].contains(ext)) {
+      return Icons.movie;
+    }
+    
+    // Audio
+    if (['mp3', 'wav', 'flac', 'aac', 'ogg', 'm4a', 'wma', 'opus'].contains(ext)) {
+      return Icons.music_note;
+    }
+    
+    // Documents
     if (['pdf'].contains(ext)) return Icons.picture_as_pdf;
-    if (['zip', 'rar', '7z'].contains(ext)) return Icons.archive;
-    if (['doc', 'docx', 'txt'].contains(ext)) return Icons.description;
+    if (['doc', 'docx'].contains(ext)) return Icons.description;
+    if (['xls', 'xlsx'].contains(ext)) return Icons.table_chart;
+    if (['ppt', 'pptx'].contains(ext)) return Icons.slideshow;
+    
+    // Code
+    if (['js', 'ts', 'jsx', 'tsx'].contains(ext)) return Icons.javascript;
+    if (['html', 'css', 'scss', 'sass'].contains(ext)) return Icons.code;
+    if (['dart', 'java', 'kt', 'swift'].contains(ext)) return Icons.developer_mode;
+    if (['py', 'rb', 'php', 'go'].contains(ext)) return Icons.terminal;
+    if (['json', 'xml', 'yaml', 'yml'].contains(ext)) return Icons.data_object;
+    
+    // Archives
+    if (['zip', 'rar', '7z', 'tar', 'gz', 'bz2'].contains(ext)) return Icons.archive;
+    
+    // Executables
+    if (['exe', 'msi', 'dmg', 'app', 'apk', 'ipa'].contains(ext)) return Icons.apps;
+    
+    // Fonts
+    if (['ttf', 'otf', 'woff', 'woff2'].contains(ext)) return Icons.font_download;
+    
+    // 3D / CAD
+    if (['obj', 'fbx', 'stl', 'blend', '3ds'].contains(ext)) return Icons.view_in_ar;
+    
+    // Database
+    if (['db', 'sqlite', 'sql', 'mdb'].contains(ext)) return Icons.storage;
+    
+    // Text / Config
+    if (['txt', 'md', 'rtf', 'log'].contains(ext)) return Icons.article;
+    
     return Icons.insert_drive_file;
   }
 }

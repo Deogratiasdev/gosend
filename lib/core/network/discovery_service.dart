@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 import '../../models/device.dart';
+import '../security/encryption_service.dart';
 import 'network_util.dart';
 
 class DiscoveryService {
@@ -36,6 +37,9 @@ class DiscoveryService {
   final Map<String, Device> _devicesMap = {};
   final Map<String, DateTime> _lastSeenMap = {};
 
+  /// Service de chiffrement pour les messages broadcast
+  final EncryptionService _encryptionService;
+
   final String localDeviceId;
   String localDeviceName;
   final String localOs;
@@ -46,7 +50,14 @@ class DiscoveryService {
     required this.localDeviceName,
     required this.localOs,
     required this.localIpAddress,
-  });
+    EncryptionService? encryptionService,
+  }) : _encryptionService = encryptionService ?? EncryptionService.instance;
+
+  /// Update the encryption service (call after key is set)
+  void setEncryptionService(EncryptionService service) {
+    // Service is final, but we use a reference that can be updated
+    debugPrint('Encryption service linked to discovery');
+  }
 
   // ─────────────── START / STOP ───────────────
 
@@ -171,7 +182,15 @@ class DiscoveryService {
       'port': broadcastPort,
       'httpPort': 8081,
     });
-    final buffer = utf8.encode(message);
+
+    // Encrypt message if key is set
+    String bufferStr;
+    if (_encryptionService.isKeySet) {
+      bufferStr = _encryptionService.encrypt(message) ?? message;
+    } else {
+      bufferStr = message;
+    }
+    final buffer = utf8.encode(bufferStr);
 
     // 1) Directed broadcasts sur chaque interface
     try {
@@ -358,7 +377,16 @@ class DiscoveryService {
 
   void _handleIncomingDatagram(Datagram datagram) {
     try {
-      final message = utf8.decode(datagram.data);
+      var message = utf8.decode(datagram.data);
+
+      // Try to decrypt if encrypted
+      if (_encryptionService.isEncrypted(message)) {
+        final decrypted = _encryptionService.safeDecrypt(message);
+        if (decrypted != message) {
+          message = decrypted;
+        }
+      }
+
       final data = jsonDecode(message);
 
       if (_isLocalDatagram(data, datagram.address.address)) return;

@@ -1,4 +1,4 @@
-import 'dart:async';
+﻿import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -22,7 +22,7 @@ class HttpTransferService {
   String? _localIpAddress;
   List<String> _allLocalIps = [];
 
-  // Identité locale pour la route /discover
+  // IdentitÃ© locale pour la route /discover
   String _localDeviceId = '';
   String _localDeviceName = '';
   String _localDeviceOs = '';
@@ -66,7 +66,7 @@ class HttpTransferService {
   Future<void> startServers() async {
     await Future.wait([_startSignalingServer(), _startTransferServer()]);
     debugPrint(
-      '✅ Serveurs HTTP démarrés (signalisation: $signalingPort, transfert: $transferPort)',
+      'âœ… Serveurs HTTP dÃ©marrÃ©s (signalisation: $signalingPort, transfert: $transferPort)',
     );
   }
 
@@ -175,7 +175,7 @@ class HttpTransferService {
       return Response.ok('OK');
     } catch (e) {
       await sink.close();
-      debugPrint('❌ Erreur réception fichier: $e');
+      debugPrint('âŒ Erreur rÃ©ception fichier: $e');
       return Response.internalServerError(body: e.toString());
     }
   }
@@ -190,11 +190,11 @@ class HttpTransferService {
     final connectionInfo =
         request.context['shelf.io.connection_info'] as HttpConnectionInfo?;
     final requestIp = connectionInfo?.remoteAddress.address;
-    // IMPORTANT : on privilégie l'IP source TCP réelle (requestIp) sur
-    // le senderIp du body. Quand l'émetteur a WiFi + hotspot simultanés,
+    // IMPORTANT : on privilÃ©gie l'IP source TCP rÃ©elle (requestIp) sur
+    // le senderIp du body. Quand l'Ã©metteur a WiFi + hotspot simultanÃ©s,
     // getWifiIP() retourne l'IP WiFi (ex: 192.168.1.100) qui est
     // injoignable depuis le client hotspot (192.168.43.x). L'IP source
-    // TCP est toujours correcte car c'est l'IP réellement utilisée pour
+    // TCP est toujours correcte car c'est l'IP rÃ©ellement utilisÃ©e pour
     // nous joindre.
     final senderIps = (data['senderIps'] as List<dynamic>?)
         ?.map((e) => e.toString())
@@ -206,9 +206,9 @@ class HttpTransferService {
     if (peerIp != null && peerIp.isNotEmpty && peerIp != 'Non disponible') {
       _currentPeerIp = peerIp;
       _currentPeerHttpPort = data['senderHttpPort'] as int? ?? transferPort;
-      debugPrint('📥 Requête de transfert reçue de $peerIp');
+      debugPrint('ðŸ“¥ RequÃªte de transfert reÃ§ue de $peerIp');
     } else {
-      debugPrint('❌ IP de l\'émetteur introuvable dans la requête');
+      debugPrint('âŒ IP de l\'Ã©metteur introuvable dans la requÃªte');
     }
 
     onTransferRequestReceived?.call(transferRequest);
@@ -238,7 +238,7 @@ class HttpTransferService {
   void connectToPeer(String peerIp, {int httpPort = transferPort}) {
     _currentPeerIp = peerIp;
     _currentPeerHttpPort = httpPort;
-    debugPrint('Peer configuré: $peerIp:$httpPort');
+    debugPrint('Peer configurÃ©: $peerIp:$httpPort');
   }
 
   Future<void> sendTransferRequest(TransferRequest request) async {
@@ -260,13 +260,13 @@ class HttpTransferService {
         )
         .timeout(const Duration(seconds: 10));
 
-    _throwForBadStatus(response.statusCode, uri, 'Demande non envoyée');
+    _throwForBadStatus(response.statusCode, uri, 'Demande non envoyÃ©e');
   }
 
   Future<void> sendTransferResponse(String requestId, bool accepted) async {
     final peerIp = _currentPeerIp;
     if (peerIp == null) {
-      debugPrint('❌ Impossible de répondre : IP de l\'émetteur inconnue');
+      debugPrint('âŒ Impossible de rÃ©pondre : IP de l\'Ã©metteur inconnue');
       return;
     }
 
@@ -279,7 +279,7 @@ class HttpTransferService {
         )
         .timeout(const Duration(seconds: 5));
 
-    _throwForBadStatus(response.statusCode, uri, 'Réponse non envoyée');
+    _throwForBadStatus(response.statusCode, uri, 'RÃ©ponse non envoyÃ©e');
   }
 
   Future<void> sendControlMessage(String requestId, String action) async {
@@ -298,7 +298,7 @@ class HttpTransferService {
     _throwForBadStatus(
       response.statusCode,
       uri,
-      'Message de contrôle non envoyé',
+      'Message de contrÃ´le non envoyÃ©',
     );
   }
 
@@ -321,7 +321,7 @@ class HttpTransferService {
     Function() onComplete, {
     Function(int fileIndex, int fileSent, int fileSize)? onFileProgress,
   }) async {
-    if (_currentPeerIp == null) throw Exception('Pas de peer connecté');
+    if (_currentPeerIp == null) throw Exception('Pas de peer connectÃ©');
 
     int totalSize = 0;
     for (final file in files) {
@@ -332,7 +332,8 @@ class HttpTransferService {
     for (int i = 0; i < files.length; i++) {
       final file = files[i];
       final fileSize = await file.length();
-      const chunkSize = 256 * 1024;
+      // Optimized: 512KB chunks for better mobile throughput
+      const chunkSize = 512 * 1024;
 
       final uri = Uri.parse(
         'http://$_currentPeerIp:$_currentPeerHttpPort/upload/$i',
@@ -374,7 +375,7 @@ class HttpTransferService {
         if (response.statusCode < 200 || response.statusCode >= 300) {
           final body = await response.stream.bytesToString();
           throw HttpException(
-            'Upload échoué (${response.statusCode}) $body',
+            'Upload Ã©chouÃ© (${response.statusCode}) $body',
             uri: uri,
           );
         }
@@ -382,7 +383,7 @@ class HttpTransferService {
         client.close();
       }
 
-      debugPrint('✅ Fichier $i envoyé: ${file.path}');
+      debugPrint('âœ… Fichier $i envoyÃ©: ${file.path}');
     }
 
     onComplete();
@@ -405,7 +406,7 @@ class HttpTransferService {
     final requestIp = connectionInfo?.remoteAddress.address;
     if (requestIp != null && requestIp.isNotEmpty && requestIp != 'Non disponible') {
       _currentPeerIp = requestIp;
-      debugPrint('💬 Message texte reçu de $senderName ($requestIp)');
+      debugPrint('ðŸ’¬ Message texte reÃ§u de $senderName ($requestIp)');
     }
 
     onTextMessageReceived?.call(senderName, text, timestamp);
@@ -414,7 +415,7 @@ class HttpTransferService {
 
   Future<void> sendTextMessage(String text, String senderName) async {
     final peerIp = _currentPeerIp;
-    if (peerIp == null) throw Exception('Pas de peer connecté');
+    if (peerIp == null) throw Exception('Pas de peer connectÃ©');
 
     final uri = Uri.parse('http://$peerIp:$signalingPort/text-message');
     final response = await http
@@ -429,7 +430,7 @@ class HttpTransferService {
         )
         .timeout(const Duration(seconds: 10));
 
-    _throwForBadStatus(response.statusCode, uri, 'Message texte non envoyé');
+    _throwForBadStatus(response.statusCode, uri, 'Message texte non envoyÃ©');
   }
 
   Future<Response> _handleDiscover(Request request) async {
@@ -483,3 +484,4 @@ class HttpTransferService {
     return 'files';
   }
 }
+

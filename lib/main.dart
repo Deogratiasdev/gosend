@@ -13,6 +13,7 @@ import 'package:window_manager/window_manager.dart';
 import 'core/network/discovery_service.dart';
 import 'core/network/network_util.dart';
 import 'core/notifications/notification_service.dart';
+import 'core/security/encryption_service.dart';
 import 'core/theme/theme_service.dart';
 import 'models/device.dart';
 import 'ui/screens/home_screen.dart';
@@ -192,6 +193,9 @@ class _GoSendAppState extends State<GoSendApp> {
       await prefs.setString('device_id', deviceId);
     }
 
+    // Init encryption service singleton
+    await EncryptionService.instance.init();
+
     _localOs = os;
     _localDeviceId = deviceId;
 
@@ -204,6 +208,7 @@ class _GoSendAppState extends State<GoSendApp> {
       localDeviceName: info.name,
       localOs: os,
       localIpAddress: info.ip,
+      encryptionService: EncryptionService.instance,
     );
 
     _discoveryService.discoveredDevices.addListener(() {

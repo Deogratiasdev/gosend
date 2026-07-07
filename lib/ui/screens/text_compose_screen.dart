@@ -75,7 +75,10 @@ class _TextComposeScreenState extends State<TextComposeScreen> {
                   decoration: BoxDecoration(
                     borderRadius: BorderRadius.circular(16),
                     color: colorScheme.surface,
-                    border: Border.all(color: colorScheme.outlineVariant),
+                    border: Border.all(
+                      color: colorScheme.outlineVariant,
+                      width: 0.5,
+                    ),
                   ),
                   child: TextField(
                     controller: _controller,
