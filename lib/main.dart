@@ -6,9 +6,12 @@ import 'package:flutter/material.dart';
 import 'package:network_info_plus/network_info_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:uuid/uuid.dart';
 import 'package:window_manager/window_manager.dart';
 
 import 'core/network/discovery_service.dart';
+import 'core/network/network_util.dart';
 import 'core/notifications/notification_service.dart';
 import 'core/theme/theme_service.dart';
 import 'models/device.dart';
@@ -55,6 +58,8 @@ class _GoSendAppState extends State<GoSendApp> {
   bool _initialized = false;
   String _localDeviceName = 'Mon appareil';
   String _localIpAddress = 'En cours...';
+  String _localDeviceId = '';
+  String _localOs = '';
   Timer? _networkMonitorTimer;
 
   @override
@@ -103,7 +108,12 @@ class _GoSendAppState extends State<GoSendApp> {
     }
   }
 
-  /// Récupère le nom de l'appareil et l'IP Wi-Fi actuels
+  /// Récupère le nom de l'appareil et l'IP locale actuelle.
+  ///
+  /// CAS CRITIQUE : téléphone connecté au WiFi ET hotspot actif.
+  /// getWifiIP() retourne l'IP WiFi (ex: 192.168.1.100) mais les clients
+  /// hotspot ne peuvent joindre que l'IP hotspot (ex: 192.168.43.1).
+  /// On détecte donc si on est hôte hotspot et on override l'IP.
   Future<({String name, String ip})> _fetchNetworkInfo() async {
     String deviceName = _localDeviceName;
     String ipAddress = 'Non disponible';
@@ -128,6 +138,24 @@ class _GoSendAppState extends State<GoSendApp> {
       debugPrint('Error getting IP: $e');
     }
 
+    // Fallback : getWifiIP() retourne souvent null en mode hotspot Android
+    // (interface STA éteinte). On énumère alors les interfaces pour trouver
+    // l'IP hotspot (ex: 192.168.43.1).
+    if (ipAddress.isEmpty || ipAddress == 'Non disponible') {
+      ipAddress = await NetworkUtil.detectLocalIp();
+    }
+
+    // CAS WiFi + Hotspot : getWifiIP() retourne l'IP WiFi, mais si on est
+    // aussi hôte hotspot, les clients hotspot ne peuvent joindre que l'IP
+    // hotspot. On détecte et override.
+    if (ipAddress != 'Non disponible' && await NetworkUtil.isHotspotHost()) {
+      final hotspotIp = await NetworkUtil.detectLocalIp();
+      if (hotspotIp != 'Non disponible' && hotspotIp != ipAddress) {
+        debugPrint('Hotspot détecté : override IP $ipAddress → $hotspotIp');
+        ipAddress = hotspotIp;
+      }
+    }
+
     return (name: deviceName, ip: ipAddress);
   }
 
@@ -147,14 +175,25 @@ class _GoSendAppState extends State<GoSendApp> {
       }
       _discoveryService.updateLocalInfo(name: info.name, ipAddress: info.ip);
       // Redémarre la découverte avec la nouvelle IP/nom
-      _discoveryService.stopDiscovery();
+      await _discoveryService.stopDiscovery();
       await _discoveryService.startDiscovery();
     }
   }
 
   Future<void> _initServices() async {
     final String os = Platform.operatingSystem;
-    final String deviceId = DateTime.now().millisecondsSinceEpoch.toString();
+
+    // ID persistant : genere une fois, stocke dans SharedPreferences.
+    // Survit aux redemarrages -> identification fiable meme en multi-interface.
+    final prefs = await SharedPreferences.getInstance();
+    String deviceId = prefs.getString('device_id') ?? '';
+    if (deviceId.isEmpty) {
+      deviceId = const Uuid().v4();
+      await prefs.setString('device_id', deviceId);
+    }
+
+    _localOs = os;
+    _localDeviceId = deviceId;
 
     final info = await _fetchNetworkInfo();
     _localDeviceName = info.name;
@@ -202,6 +241,8 @@ class _GoSendAppState extends State<GoSendApp> {
                     devices: _devices,
                     localDeviceName: _localDeviceName,
                     localIpAddress: _localIpAddress,
+                    localDeviceId: _localDeviceId,
+                    localOs: _localOs,
                     discoveryService: _discoveryService,
                     onRefresh: () async {
                       // Rafraîchissement manuel : met à jour IP + nom + redémarre découverte
@@ -216,7 +257,7 @@ class _GoSendAppState extends State<GoSendApp> {
                         name: info.name,
                         ipAddress: info.ip,
                       );
-                      _discoveryService.stopDiscovery();
+                      await _discoveryService.stopDiscovery();
                       await _discoveryService.startDiscovery();
                     },
                   )

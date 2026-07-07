@@ -11,11 +11,13 @@ import 'package:provider/provider.dart';
 
 import '../../core/network/discovery_service.dart';
 import '../../core/network/http_transfer_service.dart';
+import '../../core/network/network_util.dart';
 import '../../core/notifications/notification_service.dart';
 import '../../core/theme/theme_service.dart';
 import '../../models/device.dart';
 import '../../models/transfer_request.dart';
 import '../widgets/custom_title_bar.dart';
+import 'text_compose_screen.dart';
 import 'text_message_screen.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -23,6 +25,8 @@ class HomeScreen extends StatefulWidget {
   final VoidCallback onRefresh;
   final String localDeviceName;
   final String localIpAddress;
+  final String localDeviceId;
+  final String localOs;
   final DiscoveryService discoveryService;
 
   const HomeScreen({
@@ -31,6 +35,8 @@ class HomeScreen extends StatefulWidget {
     required this.onRefresh,
     required this.localDeviceName,
     required this.localIpAddress,
+    required this.localDeviceId,
+    required this.localOs,
     required this.discoveryService,
   });
 
@@ -60,6 +66,7 @@ class _HomeScreenState extends State<HomeScreen>
   String _deviceSearchQuery = '';
   static const platform = MethodChannel('com.example.gosend/share');
   String? _receiveDirectoryPath;
+  OverlayEntry? _currentNotification;
 
   @override
   void initState() {
@@ -72,9 +79,19 @@ class _HomeScreenState extends State<HomeScreen>
       CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
     );
     _httpService = HttpTransferService(localIpAddress: widget.localIpAddress);
+    _httpService.setIdentity(
+      id: widget.localDeviceId,
+      name: widget.localDeviceName,
+      os: widget.localOs,
+    );
     _httpService.startServers().catchError((Object e) {
       debugPrint('Erreur démarrage serveurs HTTP: $e');
-      _showSnack('Erreur ouverture ports 8080/8081 : $e');
+      _notify('Erreur ouverture ports 8080/8081 : $e', icon: Icons.error_outline);
+    });
+    // Récupère toutes les IP locales pour les inclure dans les requêtes
+    // de transfert (utile quand l'appareil a WiFi + hotspot simultanés).
+    NetworkUtil.allLocalIps().then((ips) {
+      _httpService.updateAllLocalIps(ips);
     });
     _httpService.onTransferRequestReceived = _handleTransferRequest;
     _httpService.onTransferResponse = _handleTransferResponse;
@@ -95,6 +112,11 @@ class _HomeScreenState extends State<HomeScreen>
     super.didUpdateWidget(oldWidget);
     if (oldWidget.localIpAddress != widget.localIpAddress) {
       _httpService.updateLocalIpAddress(widget.localIpAddress);
+      // Met à jour la liste de toutes les IP locales pour que le service
+      // HTTP puisse les inclure dans les requêtes (utile en WiFi + hotspot).
+      NetworkUtil.allLocalIps().then((ips) {
+        _httpService.updateAllLocalIps(ips);
+      });
     }
   }
 
@@ -156,11 +178,11 @@ class _HomeScreenState extends State<HomeScreen>
         } else if (Platform.isAndroid) {
           await platform.invokeMethod('openReceiveDirectory', {'path': path});
         } else {
-          _showSnack('Ouverture du dossier non supportée sur cette plateforme');
+          _notify('Ouverture du dossier non supportée sur cette plateforme', icon: Icons.folder_off_outlined);
         }
       } catch (e) {
         debugPrint('Erreur ouverture dossier: $e');
-        _showSnack('Erreur ouverture dossier : $e');
+        _notify('Erreur ouverture dossier : $e', icon: Icons.error_outline);
       }
     }
   }
@@ -224,9 +246,9 @@ class _HomeScreenState extends State<HomeScreen>
   void _handleTransferResponse(String requestId, bool accepted) {
     if (accepted) {
       _currentTransferId = requestId;
-      _showStatusBanner(
+      _notify(
         '✅ Demande acceptée — transfert en cours…',
-        type: 'success',
+        icon: Icons.check_circle_outline_rounded,
       );
       _startFileTransfer();
     } else {
@@ -235,9 +257,9 @@ class _HomeScreenState extends State<HomeScreen>
         _isConnecting = false;
         _isTransferring = false;
       });
-      _showStatusBanner(
+      _notify(
         '❌ Demande refusée par l\'appareil distant',
-        type: 'error',
+        icon: Icons.cancel_outlined,
       );
     }
   }
@@ -380,7 +402,7 @@ class _HomeScreenState extends State<HomeScreen>
                     _statusMessage = 'Transfert terminé !';
                     _fileProgress.clear();
                   });
-                  _showSnack('Tous les fichiers enregistrés !');
+                  _notify('Tous les fichiers enregistrés !', icon: Icons.check_circle_outline_rounded);
                   NotificationService().showNotification(
                     title: 'Transfert terminé',
                     body: '${request.files.length} fichier(s) reçu(s)',
@@ -520,55 +542,150 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   Future<void> _showTextInputDialog() async {
+    // Vérifier qu'un destinataire est sélectionné
+    if (_selectedDevice == null) {
+      _notify('Sélectionne d\'abord un appareil dans la liste', icon: Icons.info_outline);
+      return;
+    }
+
+    final isMobile = MediaQuery.of(context).size.width <= 800;
+
+    if (isMobile) {
+      // Mobile : page entière similaire à l'écran de réception
+      final text = await Navigator.of(context).push<String>(
+        MaterialPageRoute(
+          builder: (_) => TextComposeScreen(
+            recipientName: _selectedDevice!.name,
+          ),
+        ),
+      );
+      if (text != null && text.isNotEmpty) {
+        await _sendTextMessage(text);
+      }
+    } else {
+      // Desktop : carte centrée
+      await _showDesktopComposeDialog();
+    }
+  }
+
+  Future<void> _showDesktopComposeDialog() async {
     final colorScheme = Theme.of(context).colorScheme;
     final controller = TextEditingController();
 
     final text = await showDialog<String>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: Row(
-          children: [
-            Icon(Icons.text_snippet_outlined, size: 20, color: colorScheme.primary),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Text(
-                'Envoyer du texte',
-                style: GoogleFonts.plusJakartaSans(fontWeight: FontWeight.w700),
-              ),
-            ),
-          ],
-        ),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          minLines: 4,
-          maxLines: 8,
-          decoration: InputDecoration(
-            hintText: 'Tape ton texte ici…',
-            hintStyle: TextStyle(color: colorScheme.onSurfaceVariant),
-            alignLabelWithHint: true,
-            border: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(12),
+      builder: (context) => Dialog(
+        backgroundColor: Colors.transparent,
+        child: Container(
+          width: 480,
+          constraints: const BoxConstraints(maxHeight: 520),
+          decoration: BoxDecoration(
+            color: colorScheme.surface,
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // Header
+                Row(
+                  children: [
+                    Container(
+                      width: 40,
+                      height: 40,
+                      decoration: BoxDecoration(
+                        color: colorScheme.primaryContainer,
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: Icon(
+                        Icons.text_snippet_outlined,
+                        size: 20,
+                        color: colorScheme.primary,
+                      ),
+                    ),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Envoyer du texte',
+                            style: GoogleFonts.plusJakartaSans(
+                              fontWeight: FontWeight.w700,
+                              fontSize: 17,
+                            ),
+                          ),
+                          Text(
+                            'À ${_selectedDevice!.name}',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 20),
+                // Text field
+                Flexible(
+                  child: Container(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(12),
+                      color: colorScheme.onSurface.withAlpha(5),
+                    ),
+                    child: TextField(
+                      controller: controller,
+                      autofocus: true,
+                      expands: true,
+                      minLines: null,
+                      maxLines: null,
+                      textAlignVertical: TextAlignVertical.top,
+                      decoration: InputDecoration(
+                        hintText: 'Tape ton texte ici…',
+                        hintStyle: GoogleFonts.plusJakartaSans(
+                          color: colorScheme.onSurfaceVariant,
+                        ),
+                        border: InputBorder.none,
+                        contentPadding: const EdgeInsets.all(16),
+                      ),
+                      style: GoogleFonts.plusJakartaSans(
+                        fontSize: 15,
+                        height: 1.5,
+                        color: colorScheme.onSurface,
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 20),
+                // Buttons
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(context),
+                      child: Text(
+                        'Annuler',
+                        style: TextStyle(color: colorScheme.onSurfaceVariant),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    FilledButton.icon(
+                      onPressed: () {
+                        final value = controller.text.trim();
+                        if (value.isNotEmpty) Navigator.pop(context, value);
+                      },
+                      icon: const Icon(Icons.send_rounded, size: 18),
+                      label: const Text('Envoyer'),
+                    ),
+                  ],
+                ),
+              ],
             ),
           ),
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: Text(
-              'Annuler',
-              style: TextStyle(color: colorScheme.onSurfaceVariant),
-            ),
-          ),
-          FilledButton.icon(
-            onPressed: () {
-              final value = controller.text.trim();
-              if (value.isNotEmpty) Navigator.pop(context, value);
-            },
-            icon: const Icon(Icons.send_rounded, size: 18),
-            label: const Text('Envoyer'),
-          ),
-        ],
       ),
     );
 
@@ -579,7 +696,7 @@ class _HomeScreenState extends State<HomeScreen>
 
   Future<void> _sendTextMessage(String text) async {
     if (_selectedDevice == null) {
-      _showSnack('Sélectionne d\'abord un appareil dans la liste');
+      _notify('Sélectionne d\'abord un appareil dans la liste', icon: Icons.info_outline);
       return;
     }
     try {
@@ -588,9 +705,9 @@ class _HomeScreenState extends State<HomeScreen>
         httpPort: _selectedDevice!.httpPort,
       );
       await _httpService.sendTextMessage(text, widget.localDeviceName);
-      _showSnack('Message envoyé à ${_selectedDevice!.name}');
+      _notify('Message envoyé à ${_selectedDevice!.name}', icon: Icons.send_outlined);
     } catch (e) {
-      _showSnack('Erreur: $e');
+      _notify('Erreur: $e', icon: Icons.error_outline);
     }
   }
 
@@ -621,85 +738,120 @@ class _HomeScreenState extends State<HomeScreen>
     final colorScheme = Theme.of(context).colorScheme;
     showDialog(
       context: context,
-      builder: (context) => AlertDialog(
-        title: Row(
-          children: [
-            Icon(Icons.person, size: 18, color: colorScheme.primary),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'Message de $senderName',
-                    style: GoogleFonts.plusJakartaSans(fontWeight: FontWeight.w700),
-                  ),
-                  Text(
-                    '${timestamp.hour.toString().padLeft(2, '0')}:${timestamp.minute.toString().padLeft(2, '0')} — '
-                    '${timestamp.day.toString().padLeft(2, '0')}/${timestamp.month.toString().padLeft(2, '0')}/${timestamp.year}',
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: colorScheme.onSurfaceVariant,
+      builder: (context) => Dialog(
+        backgroundColor: Colors.transparent,
+        child: Container(
+          width: 480,
+          constraints: const BoxConstraints(maxHeight: 520),
+          decoration: BoxDecoration(
+            color: colorScheme.surface,
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // Header
+                Row(
+                  children: [
+                    Container(
+                      width: 40,
+                      height: 40,
+                      decoration: BoxDecoration(
+                        color: colorScheme.primaryContainer,
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: Icon(
+                        Icons.person,
+                        size: 20,
+                        color: colorScheme.primary,
+                      ),
+                    ),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Message de $senderName',
+                            style: GoogleFonts.plusJakartaSans(
+                              fontWeight: FontWeight.w700,
+                              fontSize: 17,
+                            ),
+                          ),
+                          Text(
+                            '${timestamp.hour.toString().padLeft(2, '0')}:${timestamp.minute.toString().padLeft(2, '0')} — '
+                            '${timestamp.day.toString().padLeft(2, '0')}/${timestamp.month.toString().padLeft(2, '0')}/${timestamp.year}',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 20),
+                // Content
+                Flexible(
+                  child: Container(
+                    width: double.infinity,
+                    constraints: const BoxConstraints(maxHeight: 360),
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(12),
+                      color: colorScheme.onSurface.withAlpha(5),
+                    ),
+                    child: SingleChildScrollView(
+                      child: SelectableText(
+                        text,
+                        style: GoogleFonts.plusJakartaSans(
+                          fontSize: 15,
+                          height: 1.6,
+                          color: colorScheme.onSurface,
+                        ),
+                      ),
                     ),
                   ),
-                ],
-              ),
+                ),
+                const SizedBox(height: 20),
+                // Buttons
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    TextButton.icon(
+                      onPressed: () {
+                        Clipboard.setData(ClipboardData(text: text));
+                        Navigator.pop(context);
+                        _notify('Texte copié !', icon: Icons.content_copy);
+                      },
+                      icon: const Icon(Icons.copy_rounded, size: 18),
+                      label: const Text('Copier'),
+                    ),
+                    const SizedBox(width: 8),
+                    FilledButton(
+                      onPressed: () => Navigator.pop(context),
+                      child: const Text('Fermer'),
+                    ),
+                  ],
+                ),
+              ],
             ),
-          ],
-        ),
-        content: SizedBox(
-          width: double.maxFinite,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Container(
-                constraints: const BoxConstraints(maxHeight: 320),
-                padding: const EdgeInsets.all(14),
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(12),
-                  color: colorScheme.onSurface.withAlpha(6),
-                ),
-                child: SingleChildScrollView(
-                  child: SelectableText(
-                    text,
-                    style: GoogleFonts.plusJakartaSans(
-                      fontSize: 14,
-                      height: 1.5,
-                      color: colorScheme.onSurface,
-                    ),
-                  ),
-                ),
-              ),
-            ],
           ),
         ),
-        actions: [
-          TextButton.icon(
-            onPressed: () {
-              Clipboard.setData(ClipboardData(text: text));
-              Navigator.pop(context);
-              _showSnack('Texte copié !');
-            },
-            icon: const Icon(Icons.copy_rounded, size: 18),
-            label: const Text('Copier'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Fermer'),
-          ),
-        ],
       ),
     );
   }
 
   Future<void> _sendFiles() async {
     if (_selectedDevice == null) {
-      _showSnack('Sélectionne d\'abord un appareil dans la liste');
+      _notify('Sélectionne d\'abord un appareil dans la liste', icon: Icons.info_outline);
       return;
     }
     if (_selectedFiles.isEmpty) {
-      _showSnack('Sélectionne d\'abord des fichiers à envoyer');
+      _notify('Sélectionne d\'abord des fichiers à envoyer', icon: Icons.info_outline);
       return;
     }
     setState(() {
@@ -734,16 +886,16 @@ class _HomeScreenState extends State<HomeScreen>
       );
       await _httpService.sendTransferRequest(request);
       _currentTransferId = request.id;
-      _showStatusBanner(
+      _notify(
         '⏳ Demande envoyée à ${_selectedDevice!.name}…',
-        type: 'pending',
+        icon: Icons.schedule_rounded,
       );
     } catch (e) {
       setState(() {
         _isConnecting = false;
         _statusMessage = 'Erreur de connexion';
       });
-      _showSnack('Erreur: $e');
+      _notify('Erreur: $e', icon: Icons.error_outline);
     }
   }
 
@@ -772,7 +924,7 @@ class _HomeScreenState extends State<HomeScreen>
             _currentTransferId = null;
             _fileProgress.clear();
           });
-          _showSnack('Fichiers envoyés avec succès !');
+          _notify('Fichiers envoyés avec succès !', icon: Icons.check_circle_outline_rounded);
         },
         onFileProgress: (fileIndex, fileSent, fileSize) {
           setState(() {
@@ -786,14 +938,136 @@ class _HomeScreenState extends State<HomeScreen>
         _isTransferring = false;
         _statusMessage = 'Erreur : $e';
       });
-      _showSnack('Erreur de transfert');
+      _notify('Erreur de transfert', icon: Icons.error_outline);
     }
   }
 
-  void _showSnack(String msg) {
-    OverlayEntry? entry;
-    entry = OverlayEntry(
-      builder: (context) => Positioned(
+  // ─────────────── À PROPOS ───────────────
+
+  void _showAbout() {
+    final isMobile = MediaQuery.of(context).size.width <= 800;
+    if (isMobile) {
+      Navigator.of(context).push(
+        MaterialPageRoute(builder: (_) => const _AboutPage()),
+      );
+    } else {
+      _showAboutDialog();
+    }
+  }
+
+  void _showAboutDialog() {
+    final colorScheme = Theme.of(context).colorScheme;
+    showDialog(
+      context: context,
+      builder: (context) => Dialog(
+        backgroundColor: Colors.transparent,
+        child: Container(
+          width: 420,
+          padding: const EdgeInsets.all(28),
+          decoration: BoxDecoration(
+            color: colorScheme.surface,
+            borderRadius: BorderRadius.circular(24),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // App icon
+              Container(
+                width: 64,
+                height: 64,
+                decoration: BoxDecoration(
+                  color: colorScheme.primaryContainer,
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: Icon(
+                  Icons.swap_horiz_rounded,
+                  size: 32,
+                  color: colorScheme.primary,
+                ),
+              ),
+              const SizedBox(height: 16),
+              Text(
+                'GoSend',
+                style: GoogleFonts.plusJakartaSans(
+                  fontWeight: FontWeight.w800,
+                  fontSize: 24,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                'P2P File Transfer Pro',
+                style: TextStyle(
+                  fontSize: 13,
+                  color: colorScheme.onSurfaceVariant,
+                ),
+              ),
+              const SizedBox(height: 20),
+              _aboutInfoRow(Icons.person_outline, 'Développeur', 'HOUNNOU Déo-Gratias', colorScheme),
+              const SizedBox(height: 10),
+              _aboutInfoRow(Icons.cake_outlined, 'Année de naissance', '2007', colorScheme),
+              const SizedBox(height: 10),
+              _aboutInfoRow(Icons.event_available, 'Projet finalisé', 'Lundi 6 juillet 2026', colorScheme),
+              const SizedBox(height: 10),
+              _aboutInfoRow(Icons.language, 'Portfolio', 'deo-gratias.pages.dev', colorScheme),
+              const SizedBox(height: 24),
+              FilledButton(
+                onPressed: () => Navigator.pop(context),
+                style: FilledButton.styleFrom(
+                  minimumSize: const Size(double.infinity, 48),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+                child: const Text('Fermer'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _aboutInfoRow(IconData icon, String label, String value, ColorScheme colorScheme) {
+    return Row(
+      children: [
+        Icon(icon, size: 18, color: colorScheme.onSurfaceVariant),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 11,
+                  color: colorScheme.onSurfaceVariant,
+                ),
+              ),
+              Text(
+                value,
+                style: GoogleFonts.plusJakartaSans(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                  color: colorScheme.onSurface,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// Notification unifiée — grise, une seule à la fois.
+  void _notify(String msg, {IconData? icon}) {
+    // Retire la notification précédente
+    if (_currentNotification != null && _currentNotification!.mounted) {
+      _currentNotification!.remove();
+    }
+
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final entry = OverlayEntry(
+      builder: (ctx) => Positioned(
         top: 60,
         left: 24,
         right: 24,
@@ -803,38 +1077,63 @@ class _HomeScreenState extends State<HomeScreen>
             alignment: Alignment.topCenter,
             child: GestureDetector(
               onTap: () {
-                entry?.remove();
-                entry = null;
+                if (_currentNotification != null &&
+                    _currentNotification!.mounted) {
+                  _currentNotification!.remove();
+                  _currentNotification = null;
+                }
               },
-              child: Container(
-                constraints: const BoxConstraints(maxWidth: 400),
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 16,
-                  vertical: 12,
-                ),
-                decoration: BoxDecoration(
-                  color: Theme.of(context).brightness == Brightness.dark
-                      ? const Color(0xFFE8E7E5)
-                      : const Color(0xFF2A2A2A),
-                  borderRadius: BorderRadius.circular(10),
-                  boxShadow: const [
-                    BoxShadow(
-                      color: Colors.black12,
-                      blurRadius: 8,
-                      offset: Offset(0, 2),
-                    ),
-                  ],
-                ),
-                child: Text(
-                  msg,
-                  style: TextStyle(
-                    color: Theme.of(context).brightness == Brightness.dark
-                        ? const Color(0xFF141414)
-                        : Colors.white,
-                    fontSize: 14,
+              child: TweenAnimationBuilder<double>(
+                tween: Tween(begin: 0.0, end: 1.0),
+                duration: const Duration(milliseconds: 250),
+                curve: Curves.easeOut,
+                builder: (_, v, child) => Opacity(
+                  opacity: v.clamp(0.0, 1.0),
+                  child: Transform.translate(
+                    offset: Offset(0, -10 * (1 - v)),
+                    child: child,
                   ),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
+                ),
+                child: Container(
+                  constraints: const BoxConstraints(maxWidth: 420),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 12,
+                  ),
+                  decoration: BoxDecoration(
+                    color: isDark
+                        ? const Color(0xFF3A3A3A)
+                        : const Color(0xFFE0E0E0),
+                    borderRadius: BorderRadius.circular(12),
+                    boxShadow: const [
+                      BoxShadow(
+                        color: Colors.black12,
+                        blurRadius: 10,
+                        offset: Offset(0, 3),
+                      ),
+                    ],
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (icon != null) ...[
+                        Icon(icon, size: 18, color: isDark ? Colors.white70 : Colors.black54),
+                        const SizedBox(width: 10),
+                      ],
+                      Flexible(
+                        child: Text(
+                          msg,
+                          style: TextStyle(
+                            color: isDark ? Colors.white : Colors.black87,
+                            fontSize: 13,
+                            fontWeight: FontWeight.w500,
+                          ),
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -842,117 +1141,14 @@ class _HomeScreenState extends State<HomeScreen>
         ),
       ),
     );
-    Overlay.of(context).insert(entry!);
-    Future.delayed(const Duration(seconds: 4), () {
-      if (entry != null && entry!.mounted) {
-        entry!.remove();
-        entry = null;
-      }
-    });
-  }
-
-  /// Affiche un banner non-bloquant stylisé pour les statuts de transfert.
-  /// [type]: 'pending' | 'success' | 'error'
-  void _showStatusBanner(String message, {String type = 'pending'}) {
-    OverlayEntry? entry;
-
-    final colors = switch (type) {
-      'success' => (
-          const Color(0xFF1A7A4A),
-          const Color(0xFFDCF5E9),
-          Icons.check_circle_outline_rounded
-        ),
-      'error' => (
-          const Color(0xFF9B2525),
-          const Color(0xFFFFEBEB),
-          Icons.cancel_outlined
-        ),
-      _ => (
-          const Color(0xFF2A4B8A),
-          const Color(0xFFE8EEFF),
-          Icons.schedule_rounded
-        ),
-    };
-    final (darkBg, lightBg, icon) = colors;
-
-    entry = OverlayEntry(
-      builder: (ctx) {
-        final isDark = Theme.of(ctx).brightness == Brightness.dark;
-        final bg = isDark ? darkBg : lightBg;
-        final textColor = isDark ? Colors.white : darkBg;
-        return Positioned(
-          top: 60,
-          left: 24,
-          right: 24,
-          child: Material(
-            color: Colors.transparent,
-            child: Align(
-              alignment: Alignment.topCenter,
-              child: GestureDetector(
-                onTap: () {
-                  entry?.remove();
-                  entry = null;
-                },
-                child: TweenAnimationBuilder<double>(
-                  tween: Tween(begin: 0.0, end: 1.0),
-                  duration: const Duration(milliseconds: 300),
-                  curve: Curves.easeOutBack,
-                  builder: (_, v, child) =>
-                      Opacity(opacity: v.clamp(0.0, 1.0), child: Transform.translate(offset: Offset(0, -10 * (1 - v)), child: child)),
-                  child: Container(
-                    constraints: const BoxConstraints(maxWidth: 420),
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 16,
-                      vertical: 12,
-                    ),
-                    decoration: BoxDecoration(
-                      color: bg,
-                      borderRadius: BorderRadius.circular(12),
-                      border: Border.all(
-                        color: darkBg.withAlpha(isDark ? 60 : 80),
-                        width: 1,
-                      ),
-                      boxShadow: [
-                        BoxShadow(
-                          color: darkBg.withAlpha(isDark ? 40 : 25),
-                          blurRadius: 12,
-                          offset: const Offset(0, 4),
-                        ),
-                      ],
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(icon, size: 18, color: textColor),
-                        const SizedBox(width: 10),
-                        Flexible(
-                          child: Text(
-                            message,
-                            style: TextStyle(
-                              color: textColor,
-                              fontSize: 13,
-                              fontWeight: FontWeight.w600,
-                            ),
-                            maxLines: 2,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-            ),
-          ),
-        );
-      },
-    );
-
-    Overlay.of(context).insert(entry!);
+    _currentNotification = entry;
+    Overlay.of(context).insert(entry);
     Future.delayed(const Duration(seconds: 3), () {
-      if (entry != null && entry!.mounted) {
-        entry!.remove();
-        entry = null;
+      if (_currentNotification != null &&
+          _currentNotification!.mounted &&
+          _currentNotification == entry) {
+        _currentNotification!.remove();
+        _currentNotification = null;
       }
     });
   }
@@ -1030,6 +1226,8 @@ class _HomeScreenState extends State<HomeScreen>
                   setState(
                     () => widget.discoveryService.toggleDiscoverability(),
                   );
+                } else if (value == 'about') {
+                  _showAbout();
                 }
               },
               itemBuilder: (BuildContext context) => [
@@ -1048,6 +1246,16 @@ class _HomeScreenState extends State<HomeScreen>
                             ? 'Rendre invisible'
                             : 'Rendre visible',
                       ),
+                    ],
+                  ),
+                ),
+                const PopupMenuItem(
+                  value: 'about',
+                  child: Row(
+                    children: [
+                      Icon(Icons.info_outline),
+                      SizedBox(width: 8),
+                      Text('À propos'),
                     ],
                   ),
                 ),
@@ -1357,28 +1565,46 @@ class _HomeScreenState extends State<HomeScreen>
             onTap: _openReceiveDirectory,
             child: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
-              child: Row(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Icon(
-                    Icons.folder_open_rounded,
-                    size: 18,
-                    color: colorScheme.onSurfaceVariant,
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Text(
-                      'Dossier de réception',
-                      style: GoogleFonts.plusJakartaSans(
-                        fontSize: 13,
-                        fontWeight: FontWeight.w500,
+                  Row(
+                    children: [
+                      Icon(
+                        Icons.folder_open_rounded,
+                        size: 18,
                         color: colorScheme.onSurfaceVariant,
                       ),
-                    ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Text(
+                          'Dossier de réception',
+                          style: GoogleFonts.plusJakartaSans(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w500,
+                            color: colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ),
+                      Icon(
+                        Icons.chevron_right_rounded,
+                        size: 16,
+                        color: colorScheme.onSurfaceVariant,
+                      ),
+                    ],
                   ),
-                  Icon(
-                    Icons.chevron_right_rounded,
-                    size: 16,
-                    color: colorScheme.onSurfaceVariant,
+                  const SizedBox(height: 6),
+                  SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: Text(
+                      _receiveDirectoryPath!,
+                      style: TextStyle(
+                        fontSize: 10,
+                        color: colorScheme.onSurfaceVariant.withAlpha(120),
+                        fontFamily: 'monospace',
+                      ),
+                      maxLines: 1,
+                    ),
                   ),
                 ],
               ),
@@ -1433,42 +1659,81 @@ class _HomeScreenState extends State<HomeScreen>
   void _showThemeBottomSheet(BuildContext context) {
     final themeService = context.read<ThemeService>();
 
-    showModalBottomSheet(
+    showDialog(
       context: context,
-      builder: (context) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ListTile(
-              leading: const Icon(Icons.brightness_auto),
-              title: const Text('Système'),
-              subtitle: const Text('Utilise le thème du système'),
-              onTap: () async {
-                await themeService.setThemeMode(AppThemeMode.system);
-                if (context.mounted) Navigator.pop(context);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.wb_sunny),
-              title: const Text('Clair'),
-              subtitle: const Text('Thème clair'),
-              onTap: () async {
-                await themeService.setThemeMode(AppThemeMode.light);
-                if (context.mounted) Navigator.pop(context);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.nightlight_round),
-              title: const Text('Sombre'),
-              subtitle: const Text('Thème sombre'),
-              onTap: () async {
-                await themeService.setThemeMode(AppThemeMode.dark);
-                if (context.mounted) Navigator.pop(context);
-              },
-            ),
-          ],
-        ),
-      ),
+      barrierColor: Colors.black26,
+      builder: (ctx) {
+        final colorScheme = Theme.of(ctx).colorScheme;
+        final modes = [
+          (AppThemeMode.system, Icons.brightness_auto, 'Système', 'Utilise le thème du système'),
+          (AppThemeMode.light, Icons.wb_sunny, 'Clair', 'Thème clair'),
+          (AppThemeMode.dark, Icons.nightlight_round, 'Sombre', 'Thème sombre'),
+        ];
+        return AlertDialog(
+          backgroundColor: colorScheme.surface,
+          shape: const RoundedRectangleBorder(
+            borderRadius: BorderRadius.all(Radius.circular(20)),
+          ),
+          titlePadding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+          contentPadding: EdgeInsets.zero,
+          title: Row(
+            children: [
+              const Icon(Icons.palette_outlined, size: 18),
+              const SizedBox(width: 10),
+              Text(
+                'Apparence',
+                style: GoogleFonts.plusJakartaSans(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ],
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Divider(height: 1),
+              ...modes.map((item) {
+                final (mode, icon, label, subtitle) = item;
+                final selected = themeService.themeMode == mode;
+                return ListTile(
+                  leading: Icon(
+                    icon,
+                    color: selected
+                        ? colorScheme.primary
+                        : colorScheme.onSurfaceVariant,
+                  ),
+                  title: Text(
+                    label,
+                    style: GoogleFonts.plusJakartaSans(
+                      fontSize: 14,
+                      fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+                      color: selected
+                          ? colorScheme.primary
+                          : colorScheme.onSurface,
+                    ),
+                  ),
+                  subtitle: Text(
+                    subtitle,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                  trailing: selected
+                      ? Icon(Icons.check_rounded, size: 18, color: colorScheme.primary)
+                      : null,
+                  onTap: () async {
+                    await themeService.setThemeMode(mode);
+                    if (ctx.mounted) Navigator.pop(ctx);
+                  },
+                );
+              }),
+              const SizedBox(height: 4),
+            ],
+          ),
+        );
+      },
     );
   }
 
@@ -1486,74 +1751,65 @@ class _HomeScreenState extends State<HomeScreen>
             (AppThemeMode.light, Icons.wb_sunny_outlined, 'Clair'),
             (AppThemeMode.dark, Icons.nightlight_outlined, 'Sombre'),
           ];
-          return Dialog(
-            insetPadding: const EdgeInsets.symmetric(
-              horizontal: 40,
-              vertical: 24,
-            ),
-            alignment: Alignment.center,
+          return AlertDialog(
             backgroundColor: colorScheme.surface,
             shape: const RoundedRectangleBorder(
               borderRadius: BorderRadius.all(Radius.circular(20)),
             ),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(vertical: 12),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(20, 8, 20, 12),
-                    child: Row(
-                      children: [
-                        const Icon(Icons.palette_outlined, size: 18),
-                        const SizedBox(width: 10),
-                        Text(
-                          'Apparence',
-                          style: GoogleFonts.plusJakartaSans(
-                            fontSize: 15,
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                      ],
-                    ),
+            titlePadding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+            contentPadding: EdgeInsets.zero,
+            title: Row(
+              children: [
+                const Icon(Icons.palette_outlined, size: 18),
+                const SizedBox(width: 10),
+                Text(
+                  'Apparence',
+                  style: GoogleFonts.plusJakartaSans(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w700,
                   ),
-                  const Divider(height: 1),
-                  ...modes.map((item) {
-                    final (mode, icon, label) = item;
-                    final selected = themeService.themeMode == mode;
-                    return ListTile(
-                      leading: Icon(
-                        icon,
+                ),
+              ],
+            ),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Divider(height: 1),
+                ...modes.map((item) {
+                  final (mode, icon, label) = item;
+                  final selected = themeService.themeMode == mode;
+                  return ListTile(
+                    leading: Icon(
+                      icon,
+                      color: selected
+                          ? colorScheme.primary
+                          : colorScheme.onSurfaceVariant,
+                    ),
+                    title: Text(
+                      label,
+                      style: GoogleFonts.plusJakartaSans(
+                        fontSize: 14,
+                        fontWeight: selected
+                            ? FontWeight.w600
+                            : FontWeight.w400,
                         color: selected
                             ? colorScheme.primary
-                            : colorScheme.onSurfaceVariant,
+                            : colorScheme.onSurface,
                       ),
-                      title: Text(
-                        label,
-                        style: GoogleFonts.plusJakartaSans(
-                          fontSize: 14,
-                          fontWeight: selected
-                              ? FontWeight.w600
-                              : FontWeight.w400,
-                          color: selected
-                              ? colorScheme.primary
-                              : colorScheme.onSurface,
-                        ),
-                      ),
-                      trailing: selected
-                          ? Icon(Icons.check_rounded,
-                              size: 18, color: colorScheme.primary)
-                          : null,
-                      onTap: () async {
-                        await themeService.setThemeMode(mode);
-                        setInner(() {});
-                        if (ctx.mounted) Navigator.pop(ctx);
-                      },
-                    );
-                  }),
-                  const SizedBox(height: 4),
-                ],
-              ),
+                    ),
+                    trailing: selected
+                        ? Icon(Icons.check_rounded,
+                            size: 18, color: colorScheme.primary)
+                        : null,
+                    onTap: () async {
+                      await themeService.setThemeMode(mode);
+                      setInner(() {});
+                      if (ctx.mounted) Navigator.pop(ctx);
+                    },
+                  );
+                }),
+                const SizedBox(height: 4),
+              ],
             ),
           );
         },
@@ -1574,53 +1830,101 @@ class _HomeScreenState extends State<HomeScreen>
         color: colorScheme.surface,
         border: Border.all(color: colorScheme.outlineVariant),
       ),
-      child: Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          AnimatedBuilder(
-            animation: _pulseAnimation,
-            builder: (_, __) => Transform.scale(
-              scale: _pulseAnimation.value,
-              child: Container(
-                width: 48,
-                height: 48,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: colorScheme.onSurface.withAlpha(10),
+          Row(
+            children: [
+              AnimatedBuilder(
+                animation: _pulseAnimation,
+                builder: (_, __) => Transform.scale(
+                  scale: _pulseAnimation.value,
+                  child: Container(
+                    width: 48,
+                    height: 48,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: colorScheme.onSurface.withAlpha(10),
+                    ),
+                    child: Icon(
+                      Icons.wifi_tethering,
+                      size: 24,
+                      color: colorScheme.onSurface,
+                    ),
+                  ),
                 ),
-                child: Icon(
-                  Icons.wifi_tethering,
-                  size: 24,
-                  color: colorScheme.onSurface,
+              ),
+              const SizedBox(width: 16),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      isActive ? 'Réseau actif' : 'Recherche en cours...',
+                      style: GoogleFonts.plusJakartaSans(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      isActive
+                          ? '${widget.devices.length} appareil(s) détecté(s)'
+                          : 'En attente d\'autres appareils GoSend sur le Wi-Fi',
+                      style: TextStyle(
+                        color: colorScheme.onSurfaceVariant,
+                        fontSize: 13,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          if (_receiveDirectoryPath != null) ...[
+            const SizedBox(height: 12),
+            _buildDownloadPath(),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDownloadPath() {
+    final colorScheme = Theme.of(context).colorScheme;
+    return GestureDetector(
+      onTap: _openReceiveDirectory,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(8),
+          color: colorScheme.onSurface.withAlpha(5),
+        ),
+        child: Row(
+          children: [
+            Icon(
+              Icons.download_rounded,
+              size: 14,
+              color: colorScheme.onSurfaceVariant,
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: Text(
+                  _receiveDirectoryPath ?? '',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: colorScheme.onSurfaceVariant,
+                    fontFamily: 'monospace',
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                 ),
               ),
             ),
-          ),
-          const SizedBox(width: 16),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  isActive ? 'Réseau actif' : 'Recherche en cours...',
-                  style: GoogleFonts.plusJakartaSans(
-                    fontSize: 16,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-                const SizedBox(height: 2),
-                Text(
-                  isActive
-                      ? '${widget.devices.length} appareil(s) détecté(s)'
-                      : 'En attente d\'autres appareils GoSend sur le Wi-Fi',
-                  style: TextStyle(
-                    color: colorScheme.onSurfaceVariant,
-                    fontSize: 13,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -2289,6 +2593,14 @@ class _HomeScreenState extends State<HomeScreen>
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),
+                Text(
+                  'ID: ${widget.localDeviceId.length >= 8 ? widget.localDeviceId.substring(0, 8) : widget.localDeviceId}',
+                  style: TextStyle(
+                    color: colorScheme.onSurfaceVariant.withAlpha(120),
+                    fontSize: 10,
+                    fontFamily: 'monospace',
+                  ),
+                ),
               ],
             ),
           ),
@@ -2410,6 +2722,14 @@ class _HomeScreenState extends State<HomeScreen>
                       style: TextStyle(
                         color: colorScheme.onSurfaceVariant,
                         fontSize: 11,
+                      ),
+                    ),
+                    Text(
+                      'ID: ${device.id.length >= 8 ? device.id.substring(0, 8) : device.id}',
+                      style: TextStyle(
+                        color: colorScheme.onSurfaceVariant.withAlpha(120),
+                        fontSize: 10,
+                        fontFamily: 'monospace',
                       ),
                     ),
                   ],
@@ -2554,6 +2874,127 @@ class AnimatedFractionallySizedBoxState
       alignment: Alignment.centerLeft,
       widthFactor: _widthTween?.evaluate(animation) ?? widget.widthFactor,
       child: widget.child,
+    );
+  }
+}
+
+// ─────────────── PAGE À PROPOS (MOBILE) ───────────────
+
+class _AboutPage extends StatelessWidget {
+  const _AboutPage();
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(
+          'À propos',
+          style: GoogleFonts.plusJakartaSans(fontWeight: FontWeight.w700),
+        ),
+      ),
+      body: SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            children: [
+              // App icon
+              Container(
+                width: 72,
+                height: 72,
+                decoration: BoxDecoration(
+                  color: colorScheme.primaryContainer,
+                  borderRadius: BorderRadius.circular(18),
+                ),
+                child: Icon(
+                  Icons.swap_horiz_rounded,
+                  size: 36,
+                  color: colorScheme.primary,
+                ),
+              ),
+              const SizedBox(height: 20),
+              Text(
+                'GoSend',
+                style: GoogleFonts.plusJakartaSans(
+                  fontWeight: FontWeight.w800,
+                  fontSize: 28,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                'P2P File Transfer Pro',
+                style: TextStyle(
+                  fontSize: 14,
+                  color: colorScheme.onSurfaceVariant,
+                ),
+              ),
+              const SizedBox(height: 28),
+              // Info card
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(20),
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(16),
+                  color: colorScheme.onSurface.withAlpha(5),
+                ),
+                child: Column(
+                  children: [
+                    _aboutRow(Icons.person_outline, 'Développeur', 'HOUNNOU Déo-Gratias', colorScheme),
+                    const Divider(height: 24),
+                    _aboutRow(Icons.cake_outlined, 'Année de naissance', '2007', colorScheme),
+                    const Divider(height: 24),
+                    _aboutRow(Icons.event_available, 'Projet finalisé', 'Lundi 6 juillet 2026', colorScheme),
+                    const Divider(height: 24),
+                    _aboutRow(Icons.language, 'Portfolio', 'deo-gratias.pages.dev', colorScheme),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 24),
+              FilledButton(
+                onPressed: () => Navigator.pop(context),
+                style: FilledButton.styleFrom(
+                  minimumSize: const Size(double.infinity, 50),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+                child: const Text('Fermer'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _aboutRow(IconData icon, String label, String value, ColorScheme colorScheme) {
+    return Row(
+      children: [
+        Icon(icon, size: 20, color: colorScheme.onSurfaceVariant),
+        const SizedBox(width: 14),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 11,
+                  color: colorScheme.onSurfaceVariant,
+                ),
+              ),
+              Text(
+                value,
+                style: GoogleFonts.plusJakartaSans(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
+                  color: colorScheme.onSurface,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
     );
   }
 }

@@ -20,6 +20,12 @@ class HttpTransferService {
   String? _currentPeerIp;
   int _currentPeerHttpPort = transferPort;
   String? _localIpAddress;
+  List<String> _allLocalIps = [];
+
+  // Identité locale pour la route /discover
+  String _localDeviceId = '';
+  String _localDeviceName = '';
+  String _localDeviceOs = '';
 
   List<FileInfo>? _currentFiles;
   String? _currentSaveDir;
@@ -47,6 +53,16 @@ class HttpTransferService {
     _localIpAddress = localIpAddress;
   }
 
+  void updateAllLocalIps(List<String> ips) {
+    _allLocalIps = ips.where((ip) => ip.isNotEmpty && ip != 'Non disponible').toList();
+  }
+
+  void setIdentity({required String id, required String name, required String os}) {
+    _localDeviceId = id;
+    _localDeviceName = name;
+    _localDeviceOs = os;
+  }
+
   Future<void> startServers() async {
     await Future.wait([_startSignalingServer(), _startTransferServer()]);
     debugPrint(
@@ -61,7 +77,8 @@ class HttpTransferService {
       ..post('/transfer-request', _handleTransferRequest)
       ..post('/transfer-response', _handleTransferResponse)
       ..post('/control', _handleControl)
-      ..post('/text-message', _handleTextMessage);
+      ..post('/text-message', _handleTextMessage)
+      ..get('/discover', _handleDiscover);
 
     final handler = const Pipeline().addHandler(router.call);
     _signalingServer = await shelf_io.serve(handler, '0.0.0.0', signalingPort);
@@ -173,7 +190,19 @@ class HttpTransferService {
     final connectionInfo =
         request.context['shelf.io.connection_info'] as HttpConnectionInfo?;
     final requestIp = connectionInfo?.remoteAddress.address;
-    final peerIp = _validIp(data['senderIp'] as String?) ?? _validIp(requestIp);
+    // IMPORTANT : on privilégie l'IP source TCP réelle (requestIp) sur
+    // le senderIp du body. Quand l'émetteur a WiFi + hotspot simultanés,
+    // getWifiIP() retourne l'IP WiFi (ex: 192.168.1.100) qui est
+    // injoignable depuis le client hotspot (192.168.43.x). L'IP source
+    // TCP est toujours correcte car c'est l'IP réellement utilisée pour
+    // nous joindre.
+    final senderIps = (data['senderIps'] as List<dynamic>?)
+        ?.map((e) => e.toString())
+        .where((ip) => _validIp(ip) != null)
+        .toList();
+    final peerIp = _validIp(requestIp)
+        ?? (senderIps != null && senderIps.isNotEmpty ? senderIps.first : null)
+        ?? _validIp(data['senderIp'] as String?);
     if (peerIp != null && peerIp.isNotEmpty && peerIp != 'Non disponible') {
       _currentPeerIp = peerIp;
       _currentPeerHttpPort = data['senderHttpPort'] as int? ?? transferPort;
@@ -225,6 +254,7 @@ class HttpTransferService {
             'type': 'transfer_request',
             'payload': request.toJson(),
             'senderIp': _localIpAddress,
+            'senderIps': _allLocalIps,
             'senderHttpPort': transferPort,
           }),
         )
@@ -400,6 +430,17 @@ class HttpTransferService {
         .timeout(const Duration(seconds: 10));
 
     _throwForBadStatus(response.statusCode, uri, 'Message texte non envoyé');
+  }
+
+  Future<Response> _handleDiscover(Request request) async {
+    final body = jsonEncode({
+      'id': _localDeviceId,
+      'name': _localDeviceName,
+      'os': _localDeviceOs,
+      'httpPort': transferPort,
+      'ip': _localIpAddress ?? '',
+    });
+    return Response.ok(body, headers: {'content-type': 'application/json'});
   }
 
   void _throwForBadStatus(int statusCode, Uri uri, String message) {

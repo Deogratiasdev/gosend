@@ -52,22 +52,23 @@ class TextMessageScreen extends StatelessWidget {
           ),
         ],
       ),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(20),
-        child: Container(
-          width: double.infinity,
+      body: SafeArea(
+        child: SingleChildScrollView(
           padding: const EdgeInsets.all(20),
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(16),
-            color: colorScheme.surface,
-            border: Border.all(color: colorScheme.outlineVariant),
-          ),
-          child: SelectableText(
-            text,
-            style: GoogleFonts.plusJakartaSans(
-              fontSize: 16,
-              height: 1.6,
-              color: colorScheme.onSurface,
+          child: Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(24),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(20),
+              color: colorScheme.onSurface.withAlpha(5),
+            ),
+            child: SelectableText(
+              text,
+              style: GoogleFonts.plusJakartaSans(
+                fontSize: 17,
+                height: 1.7,
+                color: colorScheme.onSurface,
+              ),
             ),
           ),
         ),

@@ -1,7 +1,7 @@
 [Setup]
 AppId={{A9241B32-E82B-4A11-8578-83C1A2E30E9B}
 AppName=GoSend
-AppVersion=1.0.0
+AppVersion=2.0.0
 AppPublisher=Déo-Gratias
 DefaultDirName={autopf}\GoSend
 DefaultGroupName=GoSend
