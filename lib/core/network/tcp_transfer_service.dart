@@ -15,7 +15,7 @@ class TcpTransferService {
   String? _currentPeerIp;
   int _currentPeerPort = defaultPort;
   String? _localIpAddress;
-
+  
   // Callback handlers
   Function(TcpTransferRequest)? onTransferRequestReceived;
   Function(String, bool)? onTransferResponse;

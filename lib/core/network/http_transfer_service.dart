@@ -140,15 +140,28 @@ class HttpTransferService {
     final total = _currentFiles!.fold<int>(0, (sum, file) => sum + file.size);
     _fileReceivedBytes[fileIndex] = 0;
 
+    // Throttle progress callbacks to avoid flooding the UI thread.
+    // Without this, each chunk triggers 2x setState() causing severe lag.
+    Timer? progressTimer;
+    int lastReported = 0;
+
+    void reportProgress() {
+      _onProgress?.call(fileIndex, _completedReceiveBytes + received, total);
+      _onFileProgress?.call(fileIndex, received, fileInfo.size);
+      lastReported = received;
+    }
+
     try {
       await for (final chunk in request.read()) {
         if (_isCancelled) {
+          progressTimer?.cancel();
           await sink.close();
           return Response(499, body: 'Transfer cancelled');
         }
         while (_isPaused) {
           await Future.delayed(const Duration(milliseconds: 100));
           if (_isCancelled) {
+            progressTimer?.cancel();
             await sink.close();
             return Response(499, body: 'Transfer cancelled');
           }
@@ -156,16 +169,28 @@ class HttpTransferService {
         sink.add(chunk);
         received += chunk.length;
         _fileReceivedBytes[fileIndex] = received;
-        _onProgress?.call(fileIndex, _completedReceiveBytes + received, total);
-        _onFileProgress?.call(fileIndex, received, fileInfo.size);
+
+        // Throttle: report at most every 200ms or every 1% of file
+        final shouldReport = progressTimer == null &&
+            (received - lastReported > 64 * 1024 || // every 64KB
+             (fileInfo.size > 0 && (received - lastReported) > fileInfo.size ~/ 100));
+        if (shouldReport) {
+          reportProgress();
+          progressTimer = Timer(const Duration(milliseconds: 200), () {
+            progressTimer = null;
+          });
+        }
       }
+      progressTimer?.cancel();
+
+      // Final flush
       await sink.flush();
       await sink.close();
 
       if (_completedFileIndexes.add(fileIndex)) {
         _completedReceiveBytes += fileInfo.size;
       }
-      _onProgress?.call(fileIndex, _completedReceiveBytes, total);
+      reportProgress();
       _onFileComplete?.call(fileIndex, filePath);
 
       if (_completedFileIndexes.length == _currentFiles!.length) {

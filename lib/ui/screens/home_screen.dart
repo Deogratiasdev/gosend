@@ -1279,6 +1279,8 @@ class _HomeScreenState extends State<HomeScreen>
               _buildFilesCard(isMobile: true),
               const SizedBox(height: 16),
               _buildDevicesSection(isMobile: true),
+              const SizedBox(height: 8),
+              _buildSearchField(),
               const SizedBox(height: 16),
               if (_selectedDevice != null) _buildSendButton(),
             ],
@@ -2665,14 +2667,14 @@ class _HomeScreenState extends State<HomeScreen>
                       ),
                       const SizedBox(width: 4),
                       Text(
-                        widget.localDeviceId.length >= 8 
+                        widget.localDeviceId.length >= 8
                             ? widget.localDeviceId.substring(0, 8).toUpperCase()
                             : widget.localDeviceId.toUpperCase(),
                         style: GoogleFonts.jetBrainsMono(
                           fontSize: 9,
-                          fontWeight: FontWeight.w600,
-                          color: colorScheme.primary,
-                          letterSpacing: 0.5,
+                          fontWeight: FontWeight.w400,
+                          color: colorScheme.primary.withAlpha(180),
+                          letterSpacing: 0.3,
                         ),
                       ),
                     ],
@@ -2829,14 +2831,14 @@ class _HomeScreenState extends State<HomeScreen>
                           ),
                           const SizedBox(width: 4),
                           Text(
-                            device.id.length >= 8 
+                            device.id.length >= 8
                                 ? device.id.substring(0, 8).toUpperCase()
                                 : device.id.toUpperCase(),
                             style: GoogleFonts.jetBrainsMono(
-                              color: colorScheme.primary,
+                              color: colorScheme.primary.withAlpha(180),
                               fontSize: 9,
-                              fontWeight: FontWeight.w600,
-                              letterSpacing: 0.5,
+                              fontWeight: FontWeight.w400,
+                              letterSpacing: 0.3,
                             ),
                           ),
                         ],
