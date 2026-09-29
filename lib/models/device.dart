@@ -12,7 +12,7 @@ class Device {
     required this.ip,
     required this.port,
     required this.os,
-    this.httpPort = 8081, // valeur par défaut
+    this.httpPort = 41732, // valeur par défaut
   });
 
   Map<String, dynamic> toJson() {
@@ -33,7 +33,7 @@ class Device {
       ip: json['ip'] as String,
       port: json['port'] as int,
       os: json['os'] as String,
-      httpPort: json['httpPort'] ?? 8081,
+      httpPort: json['httpPort'] ?? 41732,
     );
   }
 

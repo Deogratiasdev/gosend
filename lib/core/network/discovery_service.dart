@@ -10,8 +10,9 @@ import '../security/encryption_service.dart';
 import 'network_util.dart';
 
 class DiscoveryService {
-  static const int broadcastPort = 50000;
-  static const int discoveryHttpPort = 8080;
+  // Ports inhabituels, alignés avec HttpTransferService.
+  static const int broadcastPort = 41733;
+  static const int discoveryHttpPort = 41731;
   static const Duration deviceTimeout = Duration(seconds: 20);
 
   /// Un socket par interface réseau (clé = adresse IP de l'interface).
@@ -180,7 +181,7 @@ class DiscoveryService {
       'name': localDeviceName,
       'os': localOs,
       'port': broadcastPort,
-      'httpPort': 8081,
+      'httpPort': 41732,
     });
 
     // Encrypt message if key is set
@@ -279,6 +280,14 @@ class DiscoveryService {
 
   Future<void> _discoverViaArp() async {
     try {
+      // Si tous les peers connus sont frais (<30s), inutile de lire la
+      // table ARP (sur Android 10+ ça spamme des refus SELinux pour rien).
+      if (_devicesMap.isNotEmpty && _lastSeenMap.isNotEmpty) {
+        final now = DateTime.now();
+        final allFresh = _lastSeenMap.values.every(
+            (t) => now.difference(t) < const Duration(seconds: 30));
+        if (allFresh) return;
+      }
       final arpIps = await NetworkUtil.readArpTable();
       if (arpIps.isEmpty) return;
 
@@ -362,7 +371,7 @@ class DiscoveryService {
         ip: ip,
         port: data['port'] as int? ?? broadcastPort,
         os: data['os'] as String? ?? 'unknown',
-        httpPort: data['httpPort'] as int? ?? 8081,
+        httpPort: data['httpPort'] as int? ?? 41732,
       );
 
       _devicesMap[id] = device;
@@ -397,7 +406,7 @@ class DiscoveryService {
         ip: datagram.address.address,
         port: data['port'] ?? broadcastPort,
         os: data['os'] ?? 'unknown',
-        httpPort: data['httpPort'] ?? 8081,
+        httpPort: data['httpPort'] ?? 41732,
       );
 
       final uniqueKey = device.id;
@@ -462,6 +471,13 @@ class DiscoveryService {
 
   void toggleDiscoverability() {
     isDiscoverable = !isDiscoverable;
+  }
+
+  /// Pause explicite (ex. pendant un transfert : la découverte consomme
+  /// CPU/réseau pour rien et spamme les logs). Les timers vérifient déjà
+  /// [isDiscoverable], donc aucun thread n'est tué, juste mis en pause.
+  void setDiscoverable(bool value) {
+    isDiscoverable = value;
   }
 
   void updateLocalInfo({required String name, required String ipAddress}) {

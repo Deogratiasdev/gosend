@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:desktop_drop/desktop_drop.dart';
@@ -69,6 +70,16 @@ class _HomeScreenState extends State<HomeScreen>
   static const platform = MethodChannel('com.example.gosend/share');
   String? _receiveDirectoryPath;
   OverlayEntry? _currentNotification;
+  // Tokens par fichier (sécurité type LocalSend) + tailles cachées
+  // (évite les stat disque à chaque rebuild) + débit/ETA.
+  Map<int, String> _fileTokens = <int, String>{};
+  final Map<String, int> _cachedFileSizes = <String, int>{};
+  double _speedMbps = 0.0;
+  int _etaSeconds = 0;
+  int _ackedBytes = 0;
+  DateTime _lastUiUpdate = DateTime.fromMillisecondsSinceEpoch(0);
+  int _lastAckedForSpeed = 0;
+  DateTime _lastSpeedSample = DateTime.fromMillisecondsSinceEpoch(0);
 
   @override
   void initState() {
@@ -88,7 +99,7 @@ class _HomeScreenState extends State<HomeScreen>
     );
     _httpService.startServers().catchError((Object e) {
       debugPrint('Erreur démarrage serveurs HTTP: $e');
-      _notify('Erreur ouverture ports 8080/8081 : $e', icon: Icons.error_outline);
+      _notify('Erreur ouverture ports 41731/41732 : $e', icon: Icons.error_outline);
     });
     // Récupère toutes les IP locales pour les inclure dans les requêtes
     // de transfert (utile quand l'appareil a WiFi + hotspot simultanés).
@@ -245,9 +256,14 @@ class _HomeScreenState extends State<HomeScreen>
     _showTransferRequestDialog(request);
   }
 
-  void _handleTransferResponse(String requestId, bool accepted) {
+  void _handleTransferResponse(
+      String requestId, bool accepted, Map<String, String>? tokens) {
     if (accepted) {
       _currentTransferId = requestId;
+      if (tokens != null) {
+        _fileTokens = tokens.map((k, v) => MapEntry(int.tryParse(k) ?? -1, v))
+          ..removeWhere((k, _) => k < 0);
+      }
       _notify(
         '✅ Demande acceptée — transfert en cours…',
         icon: Icons.check_circle_outline_rounded,
@@ -274,6 +290,7 @@ class _HomeScreenState extends State<HomeScreen>
       setState(() => _isPaused = false);
       _httpService.resumeTransfer();
     } else if (action == 'cancel') {
+      widget.discoveryService.setDiscoverable(true);
       setState(() {
         _isTransferring = false;
         _statusMessage = 'Transfert annulé par l\'autre appareil';
@@ -299,6 +316,7 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   void _cancelTransfer() {
+    widget.discoveryService.setDiscoverable(true);
     setState(() {
       _isTransferring = false;
       _statusMessage = 'Transfert annulé';
@@ -374,35 +392,29 @@ class _HomeScreenState extends State<HomeScreen>
               final saveDirectory = await _resolveReceiveDirectory();
               final saveDir = saveDirectory.path;
               _receiveDirectoryPath = saveDir;
-              _httpService.prepareReceive(
+              final tokens = _httpService.prepareReceive(
                 request.id,
                 request.files,
                 saveDir,
                 (fileIndex, received, total) {
-                  setState(() {
-                    _totalBytesToReceive = total;
-                    _isTransferring = true;
-                    _progress = total > 0 ? received / total : 0.0;
-                    _statusMessage =
-                        'Réception : ${request.files[fileIndex].name}';
-                  });
+                  _throttledReceiveUi(
+                      total, received, request.files[fileIndex].name);
                 },
                 (fileIndex, fileReceived, fileSize) {
-                  setState(() {
-                    _fileProgress[fileIndex] = fileSize > 0
-                        ? fileReceived / fileSize
-                        : 0.0;
-                  });
+                  _throttledFileUi(fileIndex, fileReceived, fileSize);
                 },
                 (fileIndex, filePath) {
                   debugPrint('Fichier reçu: $filePath');
                 },
                 () {
+                  widget.discoveryService.setDiscoverable(true);
                   setState(() {
                     _isTransferring = false;
                     _progress = 0.0;
                     _statusMessage = 'Transfert terminé !';
                     _fileProgress.clear();
+                    _speedMbps = 0.0;
+                    _etaSeconds = 0;
                   });
                   AudioService.instance.playFileReceived();
                   _notify('Tous les fichiers enregistrés !', icon: Icons.check_circle_outline_rounded);
@@ -412,7 +424,12 @@ class _HomeScreenState extends State<HomeScreen>
                   );
                 },
               );
-              await _httpService.sendTransferResponse(request.id, true);
+              await _httpService.sendTransferResponse(request.id, true,
+                  tokens: tokens);
+              // Indispensable : sans ça, pause/cancel côté réception
+              // n'envoient aucun message (id null) et restent locaux.
+              _currentTransferId = request.id;
+              widget.discoveryService.setDiscoverable(false);
               setState(() {
                 _incomingRequests.remove(request);
                 _totalBytesToReceive = totalSize;
@@ -905,47 +922,188 @@ class _HomeScreenState extends State<HomeScreen>
     }
   }
 
+  /// UI réception throttlée : max 1 setState / 500ms.
+  void _throttledReceiveUi(int total, int received, String fileName) {
+    final now = DateTime.now();
+    _totalBytesToReceive = total;
+    _isTransferring = true;
+    _updateSpeedEta(received, total, now);
+    if (now.difference(_lastUiUpdate).inMilliseconds < 500 &&
+        received < total) {
+      return;
+    }
+    _lastUiUpdate = now;
+    if (!mounted) return;
+    setState(() {
+      _progress = total > 0 ? received / total : 0.0;
+      _statusMessage = 'Réception : $fileName'
+          '${_speedLabel()}';
+    });
+  }
+
+  void _throttledFileUi(int fileIndex, int fileReceived, int fileSize) {
+    final now = DateTime.now();
+    if (now.difference(_lastUiUpdate).inMilliseconds < 500 &&
+        fileReceived < fileSize) {
+      _fileProgress[fileIndex] =
+          fileSize > 0 ? fileReceived / fileSize : 0.0;
+      return;
+    }
+    if (!mounted) return;
+    setState(() {
+      _fileProgress[fileIndex] =
+          fileSize > 0 ? fileReceived / fileSize : 0.0;
+    });
+  }
+
+  /// Débit (EMA) + ETA à partir des octets acquittés.
+  void _updateSpeedEta(int acked, int total, DateTime now) {
+    if (_lastSpeedSample.millisecondsSinceEpoch == 0) {
+      _lastSpeedSample = now;
+      _lastAckedForSpeed = acked;
+      return;
+    }
+    final dt =
+        now.difference(_lastSpeedSample).inMilliseconds / 1000.0;
+    if (dt >= 1.0) {
+      final delta = acked - _lastAckedForSpeed;
+      final instantMbps = dt > 0 ? (delta / (1024 * 1024)) / dt : 0.0;
+      _speedMbps = _speedMbps == 0.0
+          ? instantMbps
+          : _speedMbps * 0.6 + instantMbps * 0.4;
+      _lastSpeedSample = now;
+      _lastAckedForSpeed = acked;
+      if (_speedMbps > 0.05 && total > acked) {
+        _etaSeconds =
+            ((total - acked) / (1024 * 1024) / _speedMbps).round();
+      } else {
+        _etaSeconds = 0;
+      }
+    }
+  }
+
+  String _speedLabel() {
+    if (_speedMbps <= 0) return '';
+    final eta = _etaSeconds > 0 ? ' • ${_formatEta(_etaSeconds)}' : '';
+    return ' • ${_speedMbps.toStringAsFixed(1)} Mo/s$eta';
+  }
+
+  String _formatEta(int seconds) {
+    if (seconds < 60) return '${seconds}s restantes';
+    final m = seconds ~/ 60;
+    final s = seconds % 60;
+    return '${m}m${s.toString().padLeft(2, '0')} restantes';
+  }
+
   Future<void> _startFileTransfer() async {
+    // La découverte (broadcast/sweep/ARP) consomme CPU + réseau :
+    // pause pendant le transfert, reprise à la fin.
+    widget.discoveryService.setDiscoverable(false);
     setState(() {
       _isTransferring = true;
       _isPaused = false;
       _statusMessage = 'Envoi en cours...';
+      _speedMbps = 0.0;
+      _etaSeconds = 0;
+      _ackedBytes = 0;
+      _lastUiUpdate = DateTime.fromMillisecondsSinceEpoch(0);
+      _lastSpeedSample = DateTime.now();
+      _lastAckedForSpeed = 0;
+    });
+    final sessionId = _currentTransferId!;
+    // Polling des octets réellement écrits (vérité receveur).
+    late final Timer ackTimer;
+    ackTimer = Timer.periodic(const Duration(milliseconds: 500), (_) async {
+      if (!_isTransferring || !mounted) return;
+      final ack = await _httpService.fetchAckedProgress(sessionId);
+      if (ack == null || !mounted) return;
+      final now = DateTime.now();
+      _ackedBytes = ack.totalReceived;
+      _totalBytesToReceive = ack.totalSize;
+      _updateSpeedEta(ack.totalReceived, ack.totalSize, now);
+      for (final e in ack.perFile.entries) {
+        final size = ack.perFileSize[e.key] ?? 0;
+        _fileProgress[e.key] = size > 0 ? e.value / size : 0.0;
+      }
+      setState(() {
+        _progress = ack.totalSize > 0
+            ? ack.totalReceived / ack.totalSize
+            : 0.0;
+        // Badge court : le détail (Mo/%) est déjà dans la section progrès.
+        _statusMessage = 'Envoi en cours...${_speedLabel()}';
+      });
+      // Fractions par fichier à partir des octets acquittés.
+      // (Tailles connues via _cachedFileSizes si dispo.)
     });
     try {
       await _httpService.sendFiles(
         _selectedFiles,
-        _currentTransferId!,
+        sessionId,
         (totalSent, totalSize) {
-          setState(() {
-            _totalBytesToReceive = totalSize;
-            _progress = totalSize > 0 ? totalSent / totalSize : 0.0;
-            _statusMessage = 'Envoi en cours...';
-          });
+          // Optimiste (socket) : n'écrase pas la barre si l'ack est dispo.
+          if (_ackedBytes == 0) {
+            final now = DateTime.now();
+            if (now.difference(_lastUiUpdate).inMilliseconds < 500 &&
+                totalSent < totalSize) {
+              return;
+            }
+            _lastUiUpdate = now;
+            if (!mounted) return;
+            setState(() {
+              _totalBytesToReceive = totalSize;
+              _progress = totalSize > 0 ? totalSent / totalSize : 0.0;
+              _statusMessage = 'Envoi en cours...';
+            });
+          }
         },
         () {
+          ackTimer.cancel();
+          widget.discoveryService.setDiscoverable(true);
           setState(() {
             _isTransferring = false;
             _progress = 1.0;
             _statusMessage = 'Envoi terminé !';
             _currentTransferId = null;
             _fileProgress.clear();
+            _speedMbps = 0.0;
+            _etaSeconds = 0;
+            _ackedBytes = 0;
           });
           AudioService.instance.playFileReceived();
           _notify('Fichiers envoyés avec succès !', icon: Icons.check_circle_outline_rounded);
         },
         onFileProgress: (fileIndex, fileSent, fileSize) {
+          if (_ackedBytes > 0) return; // l'ack pilote l'UI dès qu'il arrive
+          final now = DateTime.now();
+          if (now.difference(_lastUiUpdate).inMilliseconds < 500 &&
+              fileSent < fileSize) {
+            return;
+          }
+          if (!mounted) return;
           setState(() {
             _fileProgress[fileIndex] = fileSize > 0 ? fileSent / fileSize : 0.0;
           });
         },
+        tokens: _fileTokens.isEmpty ? null : _fileTokens,
       );
     } catch (e) {
+      ackTimer.cancel();
+      widget.discoveryService.setDiscoverable(true);
+      // Cancel (local ou 499 receveur) n'est pas une erreur : état propre.
+      // Ne pas écraser un message plus précis déjà affiché (ex. annulé
+      // par l'autre appareil via le canal de contrôle).
+      final cancelled = e is TransferCancelled || e.toString().contains('(499)');
+      final alreadyCancelled = _statusMessage.toLowerCase().contains('annul');
       setState(() {
         _isConnecting = false;
         _isTransferring = false;
-        _statusMessage = 'Erreur : $e';
+        if (!alreadyCancelled) {
+          _statusMessage = cancelled ? 'Transfert annulé' : 'Erreur : $e';
+        }
       });
-      _notify('Erreur de transfert', icon: Icons.error_outline);
+      if (!cancelled) {
+        _notify('Erreur de transfert', icon: Icons.error_outline);
+      }
     }
   }
 
@@ -2411,19 +2569,7 @@ class _HomeScreenState extends State<HomeScreen>
                   maxLines: 1,
                 ),
                 const SizedBox(height: 2),
-                FutureBuilder<int>(
-                  future: file.length(),
-                  builder: (_, snap) {
-                    if (!snap.hasData) return const SizedBox();
-                    return Text(
-                      _formatSize(snap.data!),
-                      style: TextStyle(
-                        fontSize: 11,
-                        color: colorScheme.onSurfaceVariant,
-                      ),
-                    );
-                  },
-                ),
+                _buildCachedSizeText(file, colorScheme),
                 if (_isTransferring && progress > 0) ...[
                   const SizedBox(height: 6),
                   ClipRRect(
@@ -2907,6 +3053,26 @@ class _HomeScreenState extends State<HomeScreen>
       style: FilledButton.styleFrom(
         padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
         textStyle: GoogleFonts.plusJakartaSans(fontWeight: FontWeight.w700),
+      ),
+    );
+  }
+
+  /// Taille disque cachée : 1 seul stat par fichier (pas par rebuild).
+  Widget _buildCachedSizeText(File file, ColorScheme colorScheme) {
+    final cached = _cachedFileSizes[file.path];
+    if (cached == null) {
+      file.length().then((size) {
+        if (!mounted) return;
+        _cachedFileSizes[file.path] = size;
+        setState(() {});
+      });
+      return const SizedBox();
+    }
+    return Text(
+      _formatSize(cached),
+      style: TextStyle(
+        fontSize: 11,
+        color: colorScheme.onSurfaceVariant,
       ),
     );
   }

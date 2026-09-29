@@ -2,10 +2,15 @@ import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/foundation.dart';
 
 /// Audio service for playing notification and UI sounds.
+///
+/// Offline-first : aucun fallback réseau (pas de requête internet sur
+/// hotspot). Si l'asset manque (non déclaré dans pubspec), on reste
+/// silencieux au lieu de spammer les logs.
 class AudioService {
   static AudioService? _instance;
   final AudioPlayer _player = AudioPlayer();
   bool _enabled = true;
+  bool _assetsMissingLogged = false;
 
   AudioService._();
 
@@ -21,83 +26,35 @@ class AudioService {
     debugPrint('🔊 Audio ${_enabled ? "activé" : "désactivé"}');
   }
 
-  /// Play sound when files are added to the list
-  Future<void> playFileAdded() async {
+  Future<void> _playAsset(String asset, double volume) async {
     if (!_enabled) return;
     try {
       await _player.stop();
-      // Use a pleasant notification sound - system default
-      await _player.play(
-        AssetSource('sounds/file_added.mp3'),
-        volume: 0.5,
-      );
-    } catch (e) {
-      // Fallback: try to play a tone if asset not found
-      debugPrint('⚠️ Son ajout fichier non disponible: $e');
-      // Play a simple system beep using TTS as fallback on mobile
-      try {
-        await _player.play(
-          UrlSource('https://actions.google.com/sounds/v1/alerts/beep_short.ogg'),
-          volume: 0.3,
-        );
-      } catch (_) {}
+      await _player.play(AssetSource(asset), volume: volume);
+    } catch (_) {
+      // Asset absent (ex. sounds/ non déclaré) : silence, un seul log.
+      if (!_assetsMissingLogged) {
+        _assetsMissingLogged = true;
+        debugPrint('🔇 Sons indisponibles ($asset manquant), audio désactivé');
+        _enabled = false;
+      }
     }
   }
+
+  /// Play sound when files are added to the list
+  Future<void> playFileAdded() => _playAsset('sounds/file_added.wav', 0.5);
 
   /// Play sound when files are received successfully
-  Future<void> playFileReceived() async {
-    if (!_enabled) return;
-    try {
-      await _player.stop();
-      await _player.play(
-        AssetSource('sounds/file_received.mp3'),
-        volume: 0.6,
-      );
-    } catch (e) {
-      debugPrint('⚠️ Son réception fichier non disponible: $e');
-      // Fallback notification sound
-      try {
-        await _player.play(
-          UrlSource('https://actions.google.com/sounds/v1/alerts/complete.ogg'),
-          volume: 0.4,
-        );
-      } catch (_) {}
-    }
-  }
+  Future<void> playFileReceived() =>
+      _playAsset('sounds/file_received.wav', 0.6);
 
   /// Play a short notification beep
-  Future<void> playNotification() async {
-    if (!_enabled) return;
-    try {
-      await _player.stop();
-      await _player.play(
-        UrlSource('https://actions.google.com/sounds/v1/alerts/beep.ogg'),
-        volume: 0.4,
-      );
-    } catch (e) {
-      debugPrint('⚠️ Son notification non disponible: $e');
-    }
-  }
+  Future<void> playNotification() =>
+      _playAsset('sounds/notification.wav', 0.4);
 
   /// Play transfer start sound
-  Future<void> playTransferStart() async {
-    if (!_enabled) return;
-    try {
-      await _player.stop();
-      await _player.play(
-        AssetSource('sounds/transfer_start.mp3'),
-        volume: 0.5,
-      );
-    } catch (e) {
-      debugPrint('⚠️ Son début transfert non disponible: $e');
-      try {
-        await _player.play(
-          UrlSource('https://actions.google.com/sounds/v1/cartoon/cartoon_boing.ogg'),
-          volume: 0.3,
-        );
-      } catch (_) {}
-    }
-  }
+  Future<void> playTransferStart() =>
+      _playAsset('sounds/transfer_start.wav', 0.5);
 
   void dispose() {
     _player.dispose();

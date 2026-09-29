@@ -1,18 +1,31 @@
 ﻿import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
+import 'package:path/path.dart' as p;
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as shelf_io;
 import 'package:shelf_router/shelf_router.dart';
 
 import '../../models/transfer_request.dart';
 
+/// Levée quand l'utilisateur annule l'envoi côté envoyeur.
+/// Permet à l'UI de distinguer "annulé" de "erreur réseau".
+class TransferCancelled implements Exception {
+  final String message;
+  TransferCancelled([this.message = 'Transfer cancelled']);
+  @override
+  String toString() => message;
+}
+
 class HttpTransferService {
-  static const int signalingPort = 8080;
-  static const int transferPort = 8081;
+  // Ports inhabituels (hors 80xx classiques) pour éviter les collisions
+  // avec d'autres apps et les scans automatiques.
+  static const int signalingPort = 41731;
+  static const int transferPort = 41732;
 
   HttpServer? _signalingServer;
   HttpServer? _transferServer;
@@ -29,9 +42,13 @@ class HttpTransferService {
 
   List<FileInfo>? _currentFiles;
   String? _currentSaveDir;
+  String? _currentTransferId;
   int _completedReceiveBytes = 0;
   final Set<int> _completedFileIndexes = <int>{};
   final Map<int, int> _fileReceivedBytes = <int, int>{};
+  /// Token par fichier, généré à l'acceptation (type LocalSend).
+  /// L'upload exige le token, sinon 403.
+  final Map<int, String> _fileTokens = <int, String>{};
   bool _isPaused = false;
   bool _isCancelled = false;
   Function(int, int, int)? _onProgress;
@@ -40,7 +57,7 @@ class HttpTransferService {
   Function()? _onAllComplete;
 
   Function(TransferRequest)? onTransferRequestReceived;
-  Function(String, bool)? onTransferResponse;
+  Function(String, bool, Map<String, String>?)? onTransferResponse;
   Function(String, String)? onControlMessage;
   Function(Uint8List, int)? onChunkReceived;
   Function(String)? onStatusUpdate;
@@ -91,14 +108,18 @@ class HttpTransferService {
     final router = Router()
       ..post('/upload/<fileIndex>', (Request request, String fileIndex) {
         return _handleFileUpload(request, int.parse(fileIndex));
-      });
+      })
+      ..get('/progress', _handleProgress);
 
     final handler = const Pipeline().addHandler(router.call);
     _transferServer = await shelf_io.serve(handler, '0.0.0.0', transferPort);
     debugPrint('Transfer HTTP server on port $transferPort');
   }
 
-  void prepareReceive(
+  /// Prépare la réception et génère un token par fichier.
+  /// Retourne les tokens (index -> token) à renvoyer à l'envoyeur
+  /// dans la réponse d'acceptation.
+  Map<int, String> prepareReceive(
     String transferId,
     List<FileInfo> files,
     String saveDir,
@@ -107,17 +128,26 @@ class HttpTransferService {
     Function(int fileIndex, String filePath) onFileComplete,
     Function() onAllComplete,
   ) {
+    _currentTransferId = transferId;
     _currentFiles = files;
     _currentSaveDir = saveDir;
     _completedReceiveBytes = 0;
     _completedFileIndexes.clear();
     _fileReceivedBytes.clear();
+    _fileTokens.clear();
+    final random = Random.secure();
+    for (int i = 0; i < files.length; i++) {
+      final bytes = List<int>.generate(16, (_) => random.nextInt(256));
+      _fileTokens[i] = base64UrlEncode(bytes);
+      _fileReceivedBytes[i] = 0;
+    }
     _isPaused = false;
     _isCancelled = false;
     _onProgress = onProgress;
     _onFileProgress = onFileProgress;
     _onFileComplete = onFileComplete;
     _onAllComplete = onAllComplete;
+    return Map<int, String>.from(_fileTokens);
   }
 
   Future<Response> _handleFileUpload(Request request, int fileIndex) async {
@@ -128,14 +158,36 @@ class HttpTransferService {
       return Response.badRequest(body: 'Invalid file index');
     }
 
+    // Token exigé (sauf session legacy sans tokens).
+    if (_fileTokens.isNotEmpty) {
+      final token = request.url.queryParameters['token'] ??
+          request.headers['x-file-token'];
+      if (token == null || token != _fileTokens[fileIndex]) {
+        return Response.forbidden('Invalid or missing file token');
+      }
+    }
+
     final fileInfo = _currentFiles![fileIndex];
     final fileName = _safeFileName(fileInfo.name);
     final subfolder = _getSubfolderForFile(fileName);
-    final filePath = '$_currentSaveDir/$subfolder/$fileName';
+    final filePath = p.normalize(p.join(_currentSaveDir!, subfolder, fileName));
+    // Confinement : le chemin final doit rester dans le dossier de réception.
+    final saveRoot = p.normalize(p.absolute(_currentSaveDir!));
+    if (!p.isWithin(saveRoot, p.absolute(filePath)) &&
+        p.absolute(filePath) != saveRoot) {
+      return Response.badRequest(body: 'Unsafe file path');
+    }
     final file = File(filePath);
     await file.parent.create(recursive: true);
 
-    final sink = file.openWrite();
+    // Écriture en .deogratias puis rename atomique (pas de partiel visible).
+    final partFile = File('$filePath.deogratias');
+    if (await partFile.exists()) {
+      try {
+        await partFile.delete();
+      } catch (_) {}
+    }
+    final sink = partFile.openWrite();
     int received = 0;
     final total = _currentFiles!.fold<int>(0, (sum, file) => sum + file.size);
     _fileReceivedBytes[fileIndex] = 0;
@@ -156,6 +208,9 @@ class HttpTransferService {
         if (_isCancelled) {
           progressTimer?.cancel();
           await sink.close();
+          try {
+            await partFile.delete();
+          } catch (_) {}
           return Response(499, body: 'Transfer cancelled');
         }
         while (_isPaused) {
@@ -163,6 +218,9 @@ class HttpTransferService {
           if (_isCancelled) {
             progressTimer?.cancel();
             await sink.close();
+            try {
+              await partFile.delete();
+            } catch (_) {}
             return Response(499, body: 'Transfer cancelled');
           }
         }
@@ -170,13 +228,13 @@ class HttpTransferService {
         received += chunk.length;
         _fileReceivedBytes[fileIndex] = received;
 
-        // Throttle: report at most every 200ms or every 1% of file
+        // Throttle: max 1 rapport / 500ms et au moins 256KB d'écart.
         final shouldReport = progressTimer == null &&
-            (received - lastReported > 64 * 1024 || // every 64KB
+            (received - lastReported > 256 * 1024 ||
              (fileInfo.size > 0 && (received - lastReported) > fileInfo.size ~/ 100));
         if (shouldReport) {
           reportProgress();
-          progressTimer = Timer(const Duration(milliseconds: 200), () {
+          progressTimer = Timer(const Duration(milliseconds: 500), () {
             progressTimer = null;
           });
         }
@@ -186,6 +244,17 @@ class HttpTransferService {
       // Final flush
       await sink.flush();
       await sink.close();
+
+      // Rename atomique .deogratias -> final.
+      try {
+        if (await file.exists()) {
+          await file.delete();
+        }
+        await partFile.rename(filePath);
+      } catch (e) {
+        debugPrint('Rename .deogratias error: $e');
+        return Response.internalServerError(body: e.toString());
+      }
 
       if (_completedFileIndexes.add(fileIndex)) {
         _completedReceiveBytes += fileInfo.size;
@@ -199,10 +268,41 @@ class HttpTransferService {
 
       return Response.ok('OK');
     } catch (e) {
-      await sink.close();
-      debugPrint('âŒ Erreur rÃ©ception fichier: $e');
+      try {
+        await sink.close();
+      } catch (_) {}
+      debugPrint('Receive file error: $e');
       return Response.internalServerError(body: e.toString());
     }
+  }
+
+  /// Octets réellement écrits côté receveur (vérité pour la barre d'envoi).
+  /// GET /progress?sessionId=...
+  Future<Response> _handleProgress(Request request) async {
+    final sessionId = request.url.queryParameters['sessionId'];
+    if (sessionId == null ||
+        _currentTransferId == null ||
+        sessionId != _currentTransferId ||
+        _currentFiles == null) {
+      return Response.badRequest(body: 'Unknown session');
+    }
+    final total = _currentFiles!.fold<int>(0, (sum, f) => sum + f.size);
+    int totalReceived = _completedReceiveBytes;
+    final files = <Map<String, dynamic>>[];
+    for (int i = 0; i < _currentFiles!.length; i++) {
+      final r = _fileReceivedBytes[i] ?? 0;
+      if (!_completedFileIndexes.contains(i)) totalReceived += r;
+      files.add({'index': i, 'received': r, 'size': _currentFiles![i].size});
+    }
+    return Response.ok(
+      jsonEncode({
+        'sessionId': sessionId,
+        'totalReceived': totalReceived,
+        'totalSize': total,
+        'files': files,
+      }),
+      headers: {'content-type': 'application/json'},
+    );
   }
 
   Future<Response> _handleTransferRequest(Request request) async {
@@ -243,9 +343,15 @@ class HttpTransferService {
   Future<Response> _handleTransferResponse(Request request) async {
     final body = await request.readAsString();
     final data = jsonDecode(body) as Map<String, dynamic>;
+    Map<String, String>? tokens;
+    final rawTokens = data['tokens'];
+    if (rawTokens is Map) {
+      tokens = rawTokens.map((k, v) => MapEntry(k.toString(), v.toString()));
+    }
     onTransferResponse?.call(
       data['requestId'] as String,
       data['accepted'] as bool,
+      tokens,
     );
     return Response.ok('OK');
   }
@@ -288,10 +394,14 @@ class HttpTransferService {
     _throwForBadStatus(response.statusCode, uri, 'Demande non envoyÃ©e');
   }
 
-  Future<void> sendTransferResponse(String requestId, bool accepted) async {
+  Future<void> sendTransferResponse(
+    String requestId,
+    bool accepted, {
+    Map<int, String>? tokens,
+  }) async {
     final peerIp = _currentPeerIp;
     if (peerIp == null) {
-      debugPrint('âŒ Impossible de rÃ©pondre : IP de l\'Ã©metteur inconnue');
+      debugPrint('Cannot reply: sender IP unknown');
       return;
     }
 
@@ -300,7 +410,12 @@ class HttpTransferService {
         .post(
           uri,
           headers: {'content-type': 'application/json'},
-          body: jsonEncode({'requestId': requestId, 'accepted': accepted}),
+          body: jsonEncode({
+            'requestId': requestId,
+            'accepted': accepted,
+            if (tokens != null)
+              'tokens': tokens.map((k, v) => MapEntry(k.toString(), v)),
+          }),
         )
         .timeout(const Duration(seconds: 5));
 
@@ -339,33 +454,61 @@ class HttpTransferService {
     _isCancelled = true;
   }
 
+  /// Envoi avec uploads parallèles (max 3 fichiers à la fois),
+  /// chunks de 1 Mo, token par fichier.
+  /// [onProgress] = octets poussés au socket (optimiste).
+  /// La vérité (octets écrits) vient de [fetchAckedProgress] (P2).
   Future<void> sendFiles(
     List<File> files,
     String transferId,
     Function(int totalSent, int totalSize) onProgress,
     Function() onComplete, {
     Function(int fileIndex, int fileSent, int fileSize)? onFileProgress,
+    Map<int, String>? tokens,
+    int maxParallel = 3,
   }) async {
-    if (_currentPeerIp == null) throw Exception('Pas de peer connectÃ©');
+    if (_currentPeerIp == null) throw Exception('Pas de peer connecté');
 
+    // Reset : les flags d'un transfert précédent ne doivent pas fuir ici.
+    _isPaused = false;
+    _isCancelled = false;
+
+    final sizes = <int>[];
     int totalSize = 0;
     for (final file in files) {
-      totalSize += await file.length();
+      final s = await file.length();
+      sizes.add(s);
+      totalSize += s;
     }
     int totalSent = 0;
 
-    for (int i = 0; i < files.length; i++) {
+    Future<void> uploadOne(int i) async {
       final file = files[i];
-      final fileSize = await file.length();
-      // Optimized: 512KB chunks for better mobile throughput
-      const chunkSize = 512 * 1024;
+      final fileSize = sizes[i];
+      const chunkSize = 1024 * 1024; // 1 Mo
 
-      final uri = Uri.parse(
+      var uri = Uri.parse(
         'http://$_currentPeerIp:$_currentPeerHttpPort/upload/$i',
       );
+      final token = tokens?[i];
+      if (token != null && token.isNotEmpty) {
+        uri = uri.replace(queryParameters: {'token': token});
+      }
       final streamedRequest = http.StreamedRequest('POST', uri)
         ..headers['content-type'] = 'application/octet-stream'
         ..headers['content-length'] = fileSize.toString();
+      if (token != null && token.isNotEmpty) {
+        streamedRequest.headers['x-file-token'] = token;
+      }
+
+      int lastSentReport = 0;
+      void reportSent(int offset) {
+        // Throttle envoyeur : 500ms min via écart 256KB (l'UI re-throttle aussi).
+        if (offset - lastSentReport >= 256 * 1024 || offset == fileSize) {
+          lastSentReport = offset;
+          onFileProgress?.call(i, offset, fileSize);
+        }
+      }
 
       final sendFuture = () async {
         final raf = await file.open();
@@ -373,6 +516,13 @@ class HttpTransferService {
           int offset = 0;
           onFileProgress?.call(i, 0, fileSize);
           while (offset < fileSize) {
+            // Cancel envoyeur : stoppe net la lecture du fichier.
+            if (_isCancelled) throw TransferCancelled();
+            // Pause envoyeur : attend au lieu de gaver les buffers TCP.
+            while (_isPaused) {
+              await Future.delayed(const Duration(milliseconds: 100));
+              if (_isCancelled) throw TransferCancelled();
+            }
             final remaining = fileSize - offset;
             final toRead = chunkSize < remaining ? chunkSize : remaining;
             final bytes = await raf.read(toRead);
@@ -381,7 +531,7 @@ class HttpTransferService {
             offset += bytes.length;
             totalSent += bytes.length;
             onProgress(totalSent, totalSize);
-            onFileProgress?.call(i, offset, fileSize);
+            reportSent(offset);
           }
         } finally {
           await raf.close();
@@ -400,7 +550,7 @@ class HttpTransferService {
         if (response.statusCode < 200 || response.statusCode >= 300) {
           final body = await response.stream.bytesToString();
           throw HttpException(
-            'Upload Ã©chouÃ© (${response.statusCode}) $body',
+            'Upload failed (${response.statusCode}) $body',
             uri: uri,
           );
         }
@@ -408,10 +558,61 @@ class HttpTransferService {
         client.close();
       }
 
-      debugPrint('âœ… Fichier $i envoyÃ©: ${file.path}');
+      debugPrint('File $i sent: ${file.path}');
     }
 
+    // Pool de workers : maxParallel uploads simultanés.
+    final queue = List<int>.generate(files.length, (i) => i);
+    Future<void> worker() async {
+      while (queue.isNotEmpty) {
+        final i = queue.removeAt(0);
+        await uploadOne(i);
+      }
+    }
+    final workers =
+        List.generate(maxParallel.clamp(1, files.isEmpty ? 1 : files.length),
+            (_) => worker());
+    await Future.wait(workers);
+
     onComplete();
+  }
+
+  /// Progression acquittée côté receveur (vérité pour la barre d'envoi).
+  /// Retourne (totalReceived, totalSize, perFile, perFileSize) ou null.
+  Future<
+      ({
+        int totalReceived,
+        int totalSize,
+        Map<int, int> perFile,
+        Map<int, int> perFileSize
+      })?> fetchAckedProgress(String sessionId) async {
+    final peerIp = _currentPeerIp;
+    if (peerIp == null) return null;
+    try {
+      final uri = Uri.parse(
+          'http://$peerIp:$_currentPeerHttpPort/progress?sessionId=$sessionId');
+      final response =
+          await http.get(uri).timeout(const Duration(seconds: 3));
+      if (response.statusCode != 200) return null;
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      final perFile = <int, int>{};
+      final perFileSize = <int, int>{};
+      final files = data['files'] as List<dynamic>? ?? [];
+      for (final f in files) {
+        final m = f as Map<String, dynamic>;
+        final idx = (m['index'] as num).toInt();
+        perFile[idx] = (m['received'] as num).toInt();
+        perFileSize[idx] = (m['size'] as num).toInt();
+      }
+      return (
+        totalReceived: (data['totalReceived'] as num).toInt(),
+        totalSize: (data['totalSize'] as num).toInt(),
+        perFile: perFile,
+        perFileSize: perFileSize,
+      );
+    } catch (_) {
+      return null;
+    }
   }
 
   void dispose() {
