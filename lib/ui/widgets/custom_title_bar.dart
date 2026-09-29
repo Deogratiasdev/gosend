@@ -9,16 +9,11 @@ class CustomTitleBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final bgColor = isLight ? const Color(0xFFFAF9F7) : const Color(0xFF141414);
-    final textColor = isLight
-        ? const Color(0xFF1C1C1C)
-        : const Color(0xFFF0EFED);
-    final iconColor = isLight
-        ? const Color(0xFF1C1C1C)
-        : const Color(0xFFF0EFED);
-    final hoverColor = isLight
-        ? const Color(0xFFE8E6E1)
-        : const Color(0xFF2C2C2C);
+    final colorScheme = Theme.of(context).colorScheme;
+    final bgColor = colorScheme.surfaceContainerLow;
+    final textColor = colorScheme.onSurface;
+    final iconColor = colorScheme.onSurface;
+    final hoverColor = colorScheme.primaryContainer;
     final closeHover = isLight
         ? const Color(0xFFE81123)
         : const Color(0xFFC42B1C);
@@ -39,13 +34,13 @@ class CustomTitleBar extends StatelessWidget {
         child: Row(
           children: [
             const SizedBox(width: 16),
-            // App icon
+            // App icon — couleur primaire unie
             Container(
               width: 20,
               height: 20,
               decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(5),
-                color: textColor,
+                borderRadius: const BorderRadius.all(Radius.circular(5)),
+                color: colorScheme.primary,
               ),
               child: Center(
                 child: Text(
@@ -53,7 +48,7 @@ class CustomTitleBar extends StatelessWidget {
                   style: GoogleFonts.plusJakartaSans(
                     fontSize: 12,
                     fontWeight: FontWeight.w800,
-                    color: bgColor,
+                    color: Colors.white,
                   ),
                 ),
               ),

@@ -60,7 +60,8 @@ class TextMessageScreen extends StatelessWidget {
             padding: const EdgeInsets.all(24),
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(20),
-              color: colorScheme.onSurface.withAlpha(5),
+              color: colorScheme.primaryContainer.withAlpha(120),
+              border: Border.all(color: colorScheme.primary.withAlpha(60)),
             ),
             child: SelectableText(
               text,

@@ -17,6 +17,7 @@ import '../../core/notifications/notification_service.dart';
 import '../../core/theme/theme_service.dart';
 import '../../models/device.dart';
 import '../../models/transfer_request.dart';
+import '../theme.dart';
 import '../widgets/custom_title_bar.dart';
 import 'text_compose_screen.dart';
 import 'text_message_screen.dart';
@@ -1064,14 +1065,14 @@ class _HomeScreenState extends State<HomeScreen>
     );
   }
 
-  /// Notification unifiée — grise, une seule à la fois.
+  /// Notification unifiée — colorée, une seule à la fois.
   void _notify(String msg, {IconData? icon}) {
     // Retire la notification précédente
     if (_currentNotification != null && _currentNotification!.mounted) {
       _currentNotification!.remove();
     }
 
-    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final colorScheme = Theme.of(context).colorScheme;
     final entry = OverlayEntry(
       builder: (ctx) => Positioned(
         top: 60,
@@ -1107,10 +1108,9 @@ class _HomeScreenState extends State<HomeScreen>
                     vertical: 12,
                   ),
                   decoration: BoxDecoration(
-                    color: isDark
-                        ? const Color(0xFF3A3A3A)
-                        : const Color(0xFFE0E0E0),
+                    color: colorScheme.primaryContainer,
                     borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: colorScheme.primary.withAlpha(60)),
                     boxShadow: const [
                       BoxShadow(
                         color: Colors.black12,
@@ -1123,16 +1123,16 @@ class _HomeScreenState extends State<HomeScreen>
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       if (icon != null) ...[
-                        Icon(icon, size: 18, color: isDark ? Colors.white70 : Colors.black54),
+                        Icon(icon, size: 18, color: colorScheme.primary),
                         const SizedBox(width: 10),
                       ],
                       Flexible(
                         child: Text(
                           msg,
                           style: TextStyle(
-                            color: isDark ? Colors.white : Colors.black87,
+                            color: colorScheme.onPrimaryContainer,
                             fontSize: 13,
-                            fontWeight: FontWeight.w500,
+                            fontWeight: FontWeight.w600,
                           ),
                           maxLines: 2,
                           overflow: TextOverflow.ellipsis,
@@ -1176,9 +1176,7 @@ class _HomeScreenState extends State<HomeScreen>
     final isLight = Theme.of(context).brightness == Brightness.light;
     return AnnotatedRegion<SystemUiOverlayStyle>(
       value: SystemUiOverlayStyle(
-        statusBarColor: isLight
-            ? const Color(0xFFFAF9F7)
-            : const Color(0xFF141414),
+        statusBarColor: colorScheme.surfaceContainerLow,
         statusBarIconBrightness: isLight ? Brightness.dark : Brightness.light,
         systemNavigationBarColor: colorScheme.surface,
         systemNavigationBarIconBrightness: isLight
@@ -1188,14 +1186,13 @@ class _HomeScreenState extends State<HomeScreen>
       child: Scaffold(
         backgroundColor: colorScheme.surfaceContainerLow,
         appBar: AppBar(
-          backgroundColor: isLight
-              ? const Color(0xFFFAF9F7)
-              : const Color(0xFF141414),
+          backgroundColor: colorScheme.surfaceContainerLow,
           title: Text(
             'GoSend',
             style: GoogleFonts.plusJakartaSans(
               fontWeight: FontWeight.w800,
               fontSize: 22,
+              color: colorScheme.primary,
             ),
           ),
           actions: [
@@ -1330,12 +1327,12 @@ class _HomeScreenState extends State<HomeScreen>
                           width: 40,
                           height: 40,
                           decoration: BoxDecoration(
-                            borderRadius: BorderRadius.circular(12),
-                            color: colorScheme.onSurface.withAlpha(10),
+                            borderRadius: const BorderRadius.all(Radius.circular(12)),
+                            color: colorScheme.primary,
                           ),
-                          child: Icon(
+                          child: const Icon(
                             Icons.send_rounded,
-                            color: colorScheme.onSurface,
+                            color: Colors.white,
                             size: 20,
                           ),
                         ),
@@ -1365,7 +1362,7 @@ class _HomeScreenState extends State<HomeScreen>
                                         height: 6,
                                         decoration: const BoxDecoration(
                                           shape: BoxShape.circle,
-                                          color: Colors.green,
+                                          color: AppTheme.success,
                                         ),
                                       ),
                                     ),
@@ -1889,12 +1886,15 @@ class _HomeScreenState extends State<HomeScreen>
                     height: 48,
                     decoration: BoxDecoration(
                       shape: BoxShape.circle,
-                      color: colorScheme.onSurface.withAlpha(10),
+                      color: isActive
+                          ? colorScheme.primary.withAlpha(20)
+                          : colorScheme.tertiary.withAlpha(20),
                     ),
                     child: Icon(
                       Icons.wifi_tethering,
                       size: 24,
-                      color: colorScheme.onSurface,
+                      color:
+                          isActive ? colorScheme.primary : colorScheme.tertiary,
                     ),
                   ),
                 ),
@@ -2063,12 +2063,12 @@ class _HomeScreenState extends State<HomeScreen>
                   height: 36,
                   decoration: BoxDecoration(
                     borderRadius: BorderRadius.circular(10),
-                    color: colorScheme.onSurface.withAlpha(10),
+                    color: colorScheme.secondary.withAlpha(25),
                   ),
                   child: Icon(
                     Icons.folder_outlined,
                     size: 18,
-                    color: colorScheme.onSurface,
+                    color: colorScheme.secondary,
                   ),
                 ),
                 const SizedBox(width: 12),
@@ -2228,14 +2228,14 @@ class _HomeScreenState extends State<HomeScreen>
                           color: colorScheme.outlineVariant,
                         ),
                       ),
-                      // Animated progress fill
+                      // Barre de progression — couleur primaire unie
                       AnimatedFractionallySizedBox(
                         duration: const Duration(milliseconds: 300),
                         widthFactor: _progress,
                         child: Container(
                           decoration: BoxDecoration(
-                            borderRadius: BorderRadius.circular(6),
-                            color: colorScheme.onSurface,
+                            borderRadius: const BorderRadius.all(Radius.circular(6)),
+                            color: colorScheme.primary,
                           ),
                         ),
                       ),
@@ -2477,18 +2477,19 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   Widget _fileIconBox(String name) {
-    final colorScheme = Theme.of(context).colorScheme;
+    final ext = name.contains('.') ? name.split('.').last : '';
+    final c = AppTheme.fileTypeColor(ext);
     return Container(
       width: 48,
       height: 48,
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(8),
-        color: colorScheme.onSurface.withAlpha(10),
+        color: c.withAlpha(25),
       ),
       child: Icon(
         _iconForFile(name),
         size: 22,
-        color: colorScheme.onSurfaceVariant,
+        color: c,
       ),
     );
   }
