@@ -27,6 +27,10 @@ class HttpTransferService {
   static const int signalingPort = 41731;
   static const int transferPort = 41732;
 
+  // Taille de chunk : 4 Mo → moins d'overhead HTTP, buffers TCP mieux remplis.
+  // Sur LAN 100 Mbps cible ≥ 8 Mo/s (vs 1-2 Mo/s avec 1 Mo).
+  static const int _chunkSize = 4 * 1024 * 1024; // 4 Mo
+
   HttpServer? _signalingServer;
   HttpServer? _transferServer;
 
@@ -35,7 +39,7 @@ class HttpTransferService {
   String? _localIpAddress;
   List<String> _allLocalIps = [];
 
-  // IdentitÃ© locale pour la route /discover
+  // Identité locale pour la route /discover
   String _localDeviceId = '';
   String _localDeviceName = '';
   String _localDeviceOs = '';
@@ -46,6 +50,11 @@ class HttpTransferService {
   int _completedReceiveBytes = 0;
   final Set<int> _completedFileIndexes = <int>{};
   final Map<int, int> _fileReceivedBytes = <int, int>{};
+
+  /// Fichiers .deogratias en cours d'écriture (fileIndex → File).
+  /// Permet la suppression immédiate à l'annulation depuis n'importe quel contexte.
+  final Map<int, File> _activePartFiles = <int, File>{};
+
   /// Token par fichier, généré à l'acceptation (type LocalSend).
   /// L'upload exige le token, sinon 403.
   final Map<int, String> _fileTokens = <int, String>{};
@@ -82,9 +91,7 @@ class HttpTransferService {
 
   Future<void> startServers() async {
     await Future.wait([_startSignalingServer(), _startTransferServer()]);
-    debugPrint(
-      'âœ… Serveurs HTTP dÃ©marrÃ©s (signalisation: $signalingPort, transfert: $transferPort)',
-    );
+    debugPrint('✅ Serveurs HTTP démarrés (signalisation: $signalingPort, transfert: $transferPort)');
   }
 
   Future<void> _startSignalingServer() async {
@@ -99,6 +106,9 @@ class HttpTransferService {
 
     final handler = const Pipeline().addHandler(router.call);
     _signalingServer = await shelf_io.serve(handler, '0.0.0.0', signalingPort);
+    // TCP no-delay : désactive l'algorithme de Nagle pour des latences moindres
+    // (chaque chunk part immédiatement sans attendre d'autres données).
+    _signalingServer?.autoCompress = false;
     debugPrint('Signaling HTTP server on port $signalingPort');
   }
 
@@ -113,7 +123,40 @@ class HttpTransferService {
 
     final handler = const Pipeline().addHandler(router.call);
     _transferServer = await shelf_io.serve(handler, '0.0.0.0', transferPort);
+    _transferServer?.autoCompress = false;
     debugPrint('Transfer HTTP server on port $transferPort');
+  }
+
+  /// Supprime tous les fichiers .deogratias orphelins dans [saveDir].
+  /// À appeler au démarrage de l'app pour nettoyer les partials d'une session précédente.
+  static Future<void> cleanupOrphanedPartFiles(String saveDir) async {
+    try {
+      final dir = Directory(saveDir);
+      if (!await dir.exists()) return;
+      await for (final entity in dir.list(recursive: true)) {
+        if (entity is File && entity.path.endsWith('.deogratias')) {
+          try {
+            await entity.delete();
+            debugPrint('🧹 Orphelin supprimé: ${entity.path}');
+          } catch (_) {}
+        }
+      }
+    } catch (e) {
+      debugPrint('Cleanup orphan error: $e');
+    }
+  }
+
+  /// Supprime immédiatement tous les fichiers .deogratias actifs.
+  /// Appelé lors de l'annulation depuis le canal de contrôle (receveur).
+  Future<void> deleteActivePartFiles() async {
+    final entries = Map<int, File>.from(_activePartFiles);
+    _activePartFiles.clear();
+    for (final f in entries.values) {
+      try {
+        if (await f.exists()) await f.delete();
+        debugPrint('🗑 .deogratias supprimé à l\'annulation: ${f.path}');
+      } catch (_) {}
+    }
   }
 
   /// Prépare la réception et génère un token par fichier.
@@ -135,6 +178,7 @@ class HttpTransferService {
     _completedFileIndexes.clear();
     _fileReceivedBytes.clear();
     _fileTokens.clear();
+    _activePartFiles.clear();
     final random = Random.secure();
     for (int i = 0; i < files.length; i++) {
       final bytes = List<int>.generate(16, (_) => random.nextInt(256));
@@ -183,17 +227,19 @@ class HttpTransferService {
     // Écriture en .deogratias puis rename atomique (pas de partiel visible).
     final partFile = File('$filePath.deogratias');
     if (await partFile.exists()) {
-      try {
-        await partFile.delete();
-      } catch (_) {}
+      try { await partFile.delete(); } catch (_) {}
     }
+
+    // Enregistre le fichier partiel pour suppression immédiate si besoin.
+    _activePartFiles[fileIndex] = partFile;
+
     final sink = partFile.openWrite();
     int received = 0;
-    final total = _currentFiles!.fold<int>(0, (sum, file) => sum + file.size);
+    final total = _currentFiles!.fold<int>(0, (sum, f) => sum + f.size);
     _fileReceivedBytes[fileIndex] = 0;
 
-    // Throttle progress callbacks to avoid flooding the UI thread.
-    // Without this, each chunk triggers 2x setState() causing severe lag.
+    // Throttle progress : max 1 rapport / 100ms (réduit depuis 500ms pour
+    // une barre plus fluide sans pour autant saturer le thread UI).
     Timer? progressTimer;
     int lastReported = 0;
 
@@ -208,19 +254,17 @@ class HttpTransferService {
         if (_isCancelled) {
           progressTimer?.cancel();
           await sink.close();
-          try {
-            await partFile.delete();
-          } catch (_) {}
+          _activePartFiles.remove(fileIndex);
+          try { await partFile.delete(); } catch (_) {}
           return Response(499, body: 'Transfer cancelled');
         }
         while (_isPaused) {
-          await Future.delayed(const Duration(milliseconds: 100));
+          await Future.delayed(const Duration(milliseconds: 50));
           if (_isCancelled) {
             progressTimer?.cancel();
             await sink.close();
-            try {
-              await partFile.delete();
-            } catch (_) {}
+            _activePartFiles.remove(fileIndex);
+            try { await partFile.delete(); } catch (_) {}
             return Response(499, body: 'Transfer cancelled');
           }
         }
@@ -228,13 +272,13 @@ class HttpTransferService {
         received += chunk.length;
         _fileReceivedBytes[fileIndex] = received;
 
-        // Throttle: max 1 rapport / 500ms et au moins 256KB d'écart.
+        // Throttle réduit à 100ms (vs 500ms avant) → barre plus réactive.
         final shouldReport = progressTimer == null &&
             (received - lastReported > 256 * 1024 ||
              (fileInfo.size > 0 && (received - lastReported) > fileInfo.size ~/ 100));
         if (shouldReport) {
           reportProgress();
-          progressTimer = Timer(const Duration(milliseconds: 500), () {
+          progressTimer = Timer(const Duration(milliseconds: 100), () {
             progressTimer = null;
           });
         }
@@ -246,13 +290,14 @@ class HttpTransferService {
       await sink.close();
 
       // Rename atomique .deogratias -> final.
+      _activePartFiles.remove(fileIndex);
       try {
-        if (await file.exists()) {
-          await file.delete();
-        }
+        if (await file.exists()) await file.delete();
         await partFile.rename(filePath);
       } catch (e) {
         debugPrint('Rename .deogratias error: $e');
+        // Le partiel reste mais on tente de le supprimer proprement.
+        try { await partFile.delete(); } catch (_) {}
         return Response.internalServerError(body: e.toString());
       }
 
@@ -268,9 +313,12 @@ class HttpTransferService {
 
       return Response.ok('OK');
     } catch (e) {
-      try {
-        await sink.close();
-      } catch (_) {}
+      // Connexion coupée brutalement (TCP reset) ou autre erreur inattendue :
+      // on ferme le sink et on supprime le .deogratias pour ne pas laisser
+      // de fichier partiel visible dans le dossier de réception.
+      try { await sink.close(); } catch (_) {}
+      _activePartFiles.remove(fileIndex);
+      try { await partFile.delete(); } catch (_) {}
       debugPrint('Receive file error: $e');
       return Response.internalServerError(body: e.toString());
     }
@@ -315,12 +363,7 @@ class HttpTransferService {
     final connectionInfo =
         request.context['shelf.io.connection_info'] as HttpConnectionInfo?;
     final requestIp = connectionInfo?.remoteAddress.address;
-    // IMPORTANT : on privilÃ©gie l'IP source TCP rÃ©elle (requestIp) sur
-    // le senderIp du body. Quand l'Ã©metteur a WiFi + hotspot simultanÃ©s,
-    // getWifiIP() retourne l'IP WiFi (ex: 192.168.1.100) qui est
-    // injoignable depuis le client hotspot (192.168.43.x). L'IP source
-    // TCP est toujours correcte car c'est l'IP rÃ©ellement utilisÃ©e pour
-    // nous joindre.
+    // On privilégie l'IP source TCP réelle (requestIp) sur le senderIp du body.
     final senderIps = (data['senderIps'] as List<dynamic>?)
         ?.map((e) => e.toString())
         .where((ip) => _validIp(ip) != null)
@@ -331,9 +374,9 @@ class HttpTransferService {
     if (peerIp != null && peerIp.isNotEmpty && peerIp != 'Non disponible') {
       _currentPeerIp = peerIp;
       _currentPeerHttpPort = data['senderHttpPort'] as int? ?? transferPort;
-      debugPrint('ðŸ“¥ RequÃªte de transfert reÃ§ue de $peerIp');
+      debugPrint('📥 Requête de transfert reçue de $peerIp');
     } else {
-      debugPrint('âŒ IP de l\'Ã©metteur introuvable dans la requÃªte');
+      debugPrint('❌ IP de l\'émetteur introuvable dans la requête');
     }
 
     onTransferRequestReceived?.call(transferRequest);
@@ -369,7 +412,7 @@ class HttpTransferService {
   void connectToPeer(String peerIp, {int httpPort = transferPort}) {
     _currentPeerIp = peerIp;
     _currentPeerHttpPort = httpPort;
-    debugPrint('Peer configurÃ©: $peerIp:$httpPort');
+    debugPrint('Peer configuré: $peerIp:$httpPort');
   }
 
   Future<void> sendTransferRequest(TransferRequest request) async {
@@ -391,7 +434,7 @@ class HttpTransferService {
         )
         .timeout(const Duration(seconds: 10));
 
-    _throwForBadStatus(response.statusCode, uri, 'Demande non envoyÃ©e');
+    _throwForBadStatus(response.statusCode, uri, 'Demande non envoyée');
   }
 
   Future<void> sendTransferResponse(
@@ -419,7 +462,7 @@ class HttpTransferService {
         )
         .timeout(const Duration(seconds: 5));
 
-    _throwForBadStatus(response.statusCode, uri, 'RÃ©ponse non envoyÃ©e');
+    _throwForBadStatus(response.statusCode, uri, 'Réponse non envoyée');
   }
 
   Future<void> sendControlMessage(String requestId, String action) async {
@@ -435,11 +478,7 @@ class HttpTransferService {
         )
         .timeout(const Duration(seconds: 5));
 
-    _throwForBadStatus(
-      response.statusCode,
-      uri,
-      'Message de contrÃ´le non envoyÃ©',
-    );
+    _throwForBadStatus(response.statusCode, uri, 'Message de contrôle non envoyé');
   }
 
   void pauseTransfer() {
@@ -455,9 +494,9 @@ class HttpTransferService {
   }
 
   /// Envoi avec uploads parallèles (max 3 fichiers à la fois),
-  /// chunks de 1 Mo, token par fichier.
+  /// chunks de 4 Mo, token par fichier.
   /// [onProgress] = octets poussés au socket (optimiste).
-  /// La vérité (octets écrits) vient de [fetchAckedProgress] (P2).
+  /// La vérité (octets écrits) vient de [fetchAckedProgress].
   Future<void> sendFiles(
     List<File> files,
     String transferId,
@@ -485,7 +524,6 @@ class HttpTransferService {
     Future<void> uploadOne(int i) async {
       final file = files[i];
       final fileSize = sizes[i];
-      const chunkSize = 1024 * 1024; // 1 Mo
 
       var uri = Uri.parse(
         'http://$_currentPeerIp:$_currentPeerHttpPort/upload/$i',
@@ -503,7 +541,7 @@ class HttpTransferService {
 
       int lastSentReport = 0;
       void reportSent(int offset) {
-        // Throttle envoyeur : 500ms min via écart 256KB (l'UI re-throttle aussi).
+        // Throttle envoyeur : 100ms via écart 256KB.
         if (offset - lastSentReport >= 256 * 1024 || offset == fileSize) {
           lastSentReport = offset;
           onFileProgress?.call(i, offset, fileSize);
@@ -520,11 +558,11 @@ class HttpTransferService {
             if (_isCancelled) throw TransferCancelled();
             // Pause envoyeur : attend au lieu de gaver les buffers TCP.
             while (_isPaused) {
-              await Future.delayed(const Duration(milliseconds: 100));
+              await Future.delayed(const Duration(milliseconds: 50));
               if (_isCancelled) throw TransferCancelled();
             }
             final remaining = fileSize - offset;
-            final toRead = chunkSize < remaining ? chunkSize : remaining;
+            final toRead = _chunkSize < remaining ? _chunkSize : remaining;
             final bytes = await raf.read(toRead);
             if (bytes.isEmpty) break;
             streamedRequest.sink.add(bytes);
@@ -632,7 +670,7 @@ class HttpTransferService {
     final requestIp = connectionInfo?.remoteAddress.address;
     if (requestIp != null && requestIp.isNotEmpty && requestIp != 'Non disponible') {
       _currentPeerIp = requestIp;
-      debugPrint('ðŸ’¬ Message texte reÃ§u de $senderName ($requestIp)');
+      debugPrint('💬 Message texte reçu de $senderName ($requestIp)');
     }
 
     onTextMessageReceived?.call(senderName, text, timestamp);
@@ -641,7 +679,7 @@ class HttpTransferService {
 
   Future<void> sendTextMessage(String text, String senderName) async {
     final peerIp = _currentPeerIp;
-    if (peerIp == null) throw Exception('Pas de peer connectÃ©');
+    if (peerIp == null) throw Exception('Pas de peer connecté');
 
     final uri = Uri.parse('http://$peerIp:$signalingPort/text-message');
     final response = await http
@@ -656,7 +694,7 @@ class HttpTransferService {
         )
         .timeout(const Duration(seconds: 10));
 
-    _throwForBadStatus(response.statusCode, uri, 'Message texte non envoyÃ©');
+    _throwForBadStatus(response.statusCode, uri, 'Message texte non envoyé');
   }
 
   Future<Response> _handleDiscover(Request request) async {
@@ -694,15 +732,12 @@ class HttpTransferService {
     }
     final ext = name.substring(dotIndex + 1).toLowerCase();
 
-    // photos
     if (const ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'tiff', 'svg', 'heic', 'heif'].contains(ext)) {
       return 'photos';
     }
-    // videos
     if (const ['mp4', 'mkv', 'avi', 'mov', 'webm', 'flv', 'wmv', '3gp'].contains(ext)) {
       return 'videos';
     }
-    // sounds
     if (const ['mp3', 'wav', 'flac', 'aac', 'ogg', 'm4a', 'wma'].contains(ext)) {
       return 'sounds';
     }
@@ -710,4 +745,3 @@ class HttpTransferService {
     return 'files';
   }
 }
-

@@ -20,6 +20,7 @@ import '../../models/device.dart';
 import '../../models/transfer_request.dart';
 import '../theme.dart';
 import '../widgets/custom_title_bar.dart';
+import 'settings_screen.dart';
 import 'text_compose_screen.dart';
 import 'text_message_screen.dart';
 
@@ -48,7 +49,7 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen>
-    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
+    with TickerProviderStateMixin, WidgetsBindingObserver {
   Device? _selectedDevice;
   List<File> _selectedFiles = [];
   bool _isDragging = false;
@@ -63,6 +64,9 @@ class _HomeScreenState extends State<HomeScreen>
   late final HttpTransferService _httpService;
   final List<TransferRequest> _incomingRequests = [];
 
+  // 0 = Envoi, 1 = Paramètres (desktop uniquement)
+  int _selectedTab = 0;
+
   String? _currentTransferId;
   bool _isPaused = false;
   final TextEditingController _deviceSearchController = TextEditingController();
@@ -70,8 +74,6 @@ class _HomeScreenState extends State<HomeScreen>
   static const platform = MethodChannel('com.example.gosend/share');
   String? _receiveDirectoryPath;
   OverlayEntry? _currentNotification;
-  // Tokens par fichier (sécurité type LocalSend) + tailles cachées
-  // (évite les stat disque à chaque rebuild) + débit/ETA.
   Map<int, String> _fileTokens = <int, String>{};
   final Map<String, int> _cachedFileSizes = <String, int>{};
   double _speedMbps = 0.0;
@@ -265,7 +267,7 @@ class _HomeScreenState extends State<HomeScreen>
           ..removeWhere((k, _) => k < 0);
       }
       _notify(
-        '✅ Demande acceptée — transfert en cours…',
+        '✅ Demande acceptée - transfert en cours…',
         icon: Icons.check_circle_outline_rounded,
       );
       _startFileTransfer();
@@ -296,6 +298,8 @@ class _HomeScreenState extends State<HomeScreen>
         _statusMessage = 'Transfert annulé par l\'autre appareil';
       });
       _httpService.cancelTransfer();
+      // Supprime immédiatement les fichiers .deogratias en cours d'écriture.
+      _httpService.deleteActivePartFiles();
     }
   }
 
@@ -804,7 +808,7 @@ class _HomeScreenState extends State<HomeScreen>
                             ),
                           ),
                           Text(
-                            '${timestamp.hour.toString().padLeft(2, '0')}:${timestamp.minute.toString().padLeft(2, '0')} — '
+                            '${timestamp.hour.toString().padLeft(2, '0')}:${timestamp.minute.toString().padLeft(2, '0')} - '
                             '${timestamp.day.toString().padLeft(2, '0')}/${timestamp.month.toString().padLeft(2, '0')}/${timestamp.year}',
                             style: TextStyle(
                               fontSize: 12,
@@ -1107,123 +1111,39 @@ class _HomeScreenState extends State<HomeScreen>
     }
   }
 
-  // ─────────────── À PROPOS ───────────────
+  // ─────────────── SETTINGS ───────────────
 
-  void _showAbout() {
+  void _openSettings(BuildContext context) {
+    final themeService = context.read<ThemeService>();
     final isMobile = MediaQuery.of(context).size.width <= 800;
     if (isMobile) {
       Navigator.of(context).push(
-        MaterialPageRoute(builder: (_) => const _AboutPage()),
+        MaterialPageRoute(
+          builder: (_) => SettingsScreen(
+            themeService: themeService,
+          ),
+        ),
       );
     } else {
-      _showAboutDialog();
+      showDialog(
+        context: context,
+        builder: (_) => Dialog(
+          backgroundColor: Colors.transparent,
+          child: SizedBox(
+            width: 480,
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(20),
+              child: SettingsScreen(
+                themeService: themeService,
+              ),
+            ),
+          ),
+        ),
+      );
     }
   }
 
-  void _showAboutDialog() {
-    final colorScheme = Theme.of(context).colorScheme;
-    showDialog(
-      context: context,
-      builder: (context) => Dialog(
-        backgroundColor: Colors.transparent,
-        child: Container(
-          width: 420,
-          padding: const EdgeInsets.all(28),
-          decoration: BoxDecoration(
-            color: colorScheme.surface,
-            borderRadius: BorderRadius.circular(24),
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              // App icon
-              Container(
-                width: 64,
-                height: 64,
-                decoration: BoxDecoration(
-                  color: colorScheme.primaryContainer,
-                  borderRadius: BorderRadius.circular(16),
-                ),
-                child: Icon(
-                  Icons.swap_horiz_rounded,
-                  size: 32,
-                  color: colorScheme.primary,
-                ),
-              ),
-              const SizedBox(height: 16),
-              Text(
-                'GoSend',
-                style: GoogleFonts.plusJakartaSans(
-                  fontWeight: FontWeight.w800,
-                  fontSize: 24,
-                ),
-              ),
-              const SizedBox(height: 4),
-              Text(
-                'P2P File Transfer Pro',
-                style: TextStyle(
-                  fontSize: 13,
-                  color: colorScheme.onSurfaceVariant,
-                ),
-              ),
-              const SizedBox(height: 20),
-              _aboutInfoRow(Icons.person_outline, 'Développeur', 'HOUNNOU Déo-Gratias', colorScheme),
-              const SizedBox(height: 10),
-              _aboutInfoRow(Icons.cake_outlined, 'Année de naissance', '2007', colorScheme),
-              const SizedBox(height: 10),
-              _aboutInfoRow(Icons.event_available, 'Projet finalisé', 'Lundi 6 juillet 2026', colorScheme),
-              const SizedBox(height: 10),
-              _aboutInfoRow(Icons.language, 'Portfolio', 'deo-gratias.pages.dev', colorScheme),
-              const SizedBox(height: 24),
-              FilledButton(
-                onPressed: () => Navigator.pop(context),
-                style: FilledButton.styleFrom(
-                  minimumSize: const Size(double.infinity, 48),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                ),
-                child: const Text('Fermer'),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _aboutInfoRow(IconData icon, String label, String value, ColorScheme colorScheme) {
-    return Row(
-      children: [
-        Icon(icon, size: 18, color: colorScheme.onSurfaceVariant),
-        const SizedBox(width: 12),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                label,
-                style: TextStyle(
-                  fontSize: 11,
-                  color: colorScheme.onSurfaceVariant,
-                ),
-              ),
-              Text(
-                value,
-                style: GoogleFonts.plusJakartaSans(
-                  fontSize: 14,
-                  fontWeight: FontWeight.w600,
-                  color: colorScheme.onSurface,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ],
-    );
-  }
-
-  /// Notification unifiée — colorée, une seule à la fois.
+  /// Notification unifiée - colorée, une seule à la fois.
   void _notify(String msg, {IconData? icon}) {
     // Retire la notification précédente
     if (_currentNotification != null && _currentNotification!.mounted) {
@@ -1371,24 +1291,15 @@ class _HomeScreenState extends State<HomeScreen>
               ),
             ),
             IconButton(
-              icon: const Icon(Icons.folder_open),
-              tooltip: 'Dossier de réception',
-              onPressed: _openReceiveDirectory,
-            ),
-            IconButton(
-              icon: const Icon(Icons.brightness_medium),
-              tooltip: 'Thème',
-              onPressed: () => _showThemeDialog(context),
+              icon: const Icon(Icons.settings_outlined),
+              tooltip: 'Paramètres',
+              onPressed: () => _openSettings(context),
             ),
             PopupMenuButton<String>(
               icon: const Icon(Icons.more_vert),
               onSelected: (value) {
                 if (value == 'invisible') {
-                  setState(
-                    () => widget.discoveryService.toggleDiscoverability(),
-                  );
-                } else if (value == 'about') {
-                  _showAbout();
+                  setState(() => widget.discoveryService.toggleDiscoverability());
                 }
               },
               itemBuilder: (BuildContext context) => [
@@ -1396,27 +1307,9 @@ class _HomeScreenState extends State<HomeScreen>
                   value: 'invisible',
                   child: Row(
                     children: [
-                      Icon(
-                        widget.discoveryService.isDiscoverable
-                            ? Icons.visibility
-                            : Icons.visibility_off,
-                      ),
+                      Icon(widget.discoveryService.isDiscoverable ? Icons.visibility : Icons.visibility_off),
                       const SizedBox(width: 8),
-                      Text(
-                        widget.discoveryService.isDiscoverable
-                            ? 'Rendre invisible'
-                            : 'Rendre visible',
-                      ),
-                    ],
-                  ),
-                ),
-                const PopupMenuItem(
-                  value: 'about',
-                  child: Row(
-                    children: [
-                      Icon(Icons.info_outline),
-                      SizedBox(width: 8),
-                      Text('À propos'),
+                      Text(widget.discoveryService.isDiscoverable ? 'Rendre invisible' : 'Rendre visible'),
                     ],
                   ),
                 ),
@@ -1460,225 +1353,173 @@ class _HomeScreenState extends State<HomeScreen>
             decoration: BoxDecoration(
               color: colorScheme.surface,
               borderRadius: BorderRadius.circular(20),
-              border: Border.all(
-                color: colorScheme.outlineVariant.withAlpha(50),
-              ),
+              border: Border.all(color: colorScheme.outlineVariant.withAlpha(50)),
             ),
             child: Column(
               children: [
                 const SizedBox(height: 16),
-                // Logo / Brand Card
+                // Brand
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 16),
                   child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 14,
-                      vertical: 14,
-                    ),
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(16),
-                      color: colorScheme.surface,
-                    ),
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+                    decoration: BoxDecoration(borderRadius: BorderRadius.circular(16), color: colorScheme.surface),
                     child: Row(
                       children: [
                         Container(
-                          width: 40,
-                          height: 40,
-                          decoration: BoxDecoration(
-                            borderRadius: const BorderRadius.all(Radius.circular(12)),
-                            color: colorScheme.primary,
-                          ),
-                          child: const Icon(
-                            Icons.send_rounded,
-                            color: Colors.white,
-                            size: 20,
-                          ),
+                          width: 40, height: 40,
+                          decoration: BoxDecoration(borderRadius: const BorderRadius.all(Radius.circular(12)), color: colorScheme.primary),
+                          child: const Icon(Icons.send_rounded, color: Colors.white, size: 20),
                         ),
                         const SizedBox(width: 12),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                'GoSend',
-                                style: GoogleFonts.plusJakartaSans(
-                                  fontSize: 16,
-                                  fontWeight: FontWeight.w800,
-                                  color: colorScheme.onSurface,
-                                  letterSpacing: -0.5,
+                        Expanded(child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text('GoSend', style: GoogleFonts.plusJakartaSans(fontSize: 16, fontWeight: FontWeight.w800, color: colorScheme.onSurface, letterSpacing: -0.5)),
+                            const SizedBox(height: 3),
+                            Row(children: [
+                              AnimatedBuilder(
+                                animation: _pulseAnimation,
+                                builder: (_, __) => Transform.scale(
+                                  scale: _pulseAnimation.value,
+                                  child: Container(width: 6, height: 6, decoration: const BoxDecoration(shape: BoxShape.circle, color: AppTheme.success)),
                                 ),
                               ),
-                              const SizedBox(height: 3),
-                              Row(
-                                children: [
-                                  AnimatedBuilder(
-                                    animation: _pulseAnimation,
-                                    builder: (_, __) => Transform.scale(
-                                      scale: _pulseAnimation.value,
-                                      child: Container(
-                                        width: 6,
-                                        height: 6,
-                                        decoration: const BoxDecoration(
-                                          shape: BoxShape.circle,
-                                          color: AppTheme.success,
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 6),
-                                  Expanded(
-                                    child: Text(
-                                      widget.localDeviceName,
-                                      style: TextStyle(
-                                        color: colorScheme.onSurfaceVariant,
-                                        fontSize: 11,
-                                        fontWeight: FontWeight.w500,
-                                      ),
-                                      overflow: TextOverflow.ellipsis,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ],
-                          ),
-                        ),
+                              const SizedBox(width: 6),
+                              Expanded(child: Text(widget.localDeviceName, style: TextStyle(color: colorScheme.onSurfaceVariant, fontSize: 11, fontWeight: FontWeight.w500), overflow: TextOverflow.ellipsis)),
+                            ]),
+                          ],
+                        )),
                       ],
                     ),
                   ),
                 ),
                 const SizedBox(height: 20),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16),
-                  child: _buildSearchField(),
-                ),
+                Padding(padding: const EdgeInsets.symmetric(horizontal: 16), child: _buildSearchField()),
                 const SizedBox(height: 20),
                 // Status pill
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 16),
                   child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 8,
-                    ),
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(20),
-                      color: colorScheme.onSurface.withAlpha(8),
-                    ),
-                    child: Row(
-                      children: [
-                        AnimatedBuilder(
-                          animation: _pulseAnimation,
-                          builder: (_, __) => Transform.scale(
-                            scale: _pulseAnimation.value,
-                            child: Container(
-                              width: 7,
-                              height: 7,
-                              decoration: BoxDecoration(
-                                shape: BoxShape.circle,
-                                color: widget.devices.isNotEmpty
-                                    ? colorScheme.onSurface
-                                    : colorScheme.onSurfaceVariant,
-                              ),
-                            ),
-                          ),
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    decoration: BoxDecoration(borderRadius: BorderRadius.circular(20), color: colorScheme.onSurface.withAlpha(8)),
+                    child: Row(children: [
+                      AnimatedBuilder(
+                        animation: _pulseAnimation,
+                        builder: (_, __) => Transform.scale(
+                          scale: _pulseAnimation.value,
+                          child: Container(width: 7, height: 7, decoration: BoxDecoration(shape: BoxShape.circle, color: widget.devices.isNotEmpty ? colorScheme.onSurface : colorScheme.onSurfaceVariant)),
                         ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: Text(
-                            widget.devices.isNotEmpty
-                                ? '${widget.devices.length} appareil(s)'
-                                : 'Recherche...',
-                            style: TextStyle(
-                              color: colorScheme.onSurfaceVariant,
-                              fontSize: 12,
-                              fontWeight: FontWeight.w500,
-                            ),
-                          ),
-                        ),
-                        IconButton(
-                          icon: Icon(
-                            widget.discoveryService.isDiscoverable
-                                ? Icons.visibility
-                                : Icons.visibility_off,
-                            size: 16,
-                            color: colorScheme.onSurfaceVariant,
-                          ),
-                          onPressed: () => setState(
-                            () =>
-                                widget.discoveryService.toggleDiscoverability(),
-                          ),
-                          tooltip: 'Visibilité',
-                          constraints: const BoxConstraints(),
-                          padding: EdgeInsets.zero,
-                        ),
-                        const SizedBox(width: 4),
-                        IconButton(
-                          icon: Icon(
-                            Icons.refresh,
-                            size: 16,
-                            color: colorScheme.onSurfaceVariant,
-                          ),
-                          onPressed: widget.onRefresh,
-                          tooltip: 'Rafraîchir',
-                          constraints: const BoxConstraints(),
-                          padding: EdgeInsets.zero,
-                        ),
-                      ],
-                    ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(child: Text(
+                        widget.devices.isNotEmpty ? '${widget.devices.length} appareil(s)' : 'Recherche...',
+                        style: TextStyle(color: colorScheme.onSurfaceVariant, fontSize: 12, fontWeight: FontWeight.w500),
+                      )),
+                      IconButton(
+                        icon: Icon(widget.discoveryService.isDiscoverable ? Icons.visibility : Icons.visibility_off, size: 16, color: colorScheme.onSurfaceVariant),
+                        onPressed: () => setState(() => widget.discoveryService.toggleDiscoverability()),
+                        tooltip: 'Visibilité', constraints: const BoxConstraints(), padding: EdgeInsets.zero,
+                      ),
+                      const SizedBox(width: 4),
+                      IconButton(
+                        icon: Icon(Icons.refresh, size: 16, color: colorScheme.onSurfaceVariant),
+                        onPressed: widget.onRefresh, tooltip: 'Rafraîchir',
+                        constraints: const BoxConstraints(), padding: EdgeInsets.zero,
+                      ),
+                    ]),
                   ),
                 ),
                 const SizedBox(height: 16),
                 Expanded(child: _buildDevicesSection(isMobile: false)),
-                const Divider(height: 1),
-                _buildSidebarFooter(),
               ],
             ),
           ),
 
-          // ── Main Content ──
+          // ── Zone droite : onglets Envoi / Paramètres ──
           Expanded(
             child: Container(
               margin: const EdgeInsets.fromLTRB(8, 16, 16, 16),
               decoration: BoxDecoration(
                 color: colorScheme.surfaceContainerLow,
                 borderRadius: BorderRadius.circular(20),
-                border: Border.all(
-                  color: colorScheme.outlineVariant.withAlpha(50),
-                ),
+                border: Border.all(color: colorScheme.outlineVariant.withAlpha(50)),
               ),
               child: Column(
                 children: [
-                  // Custom window title bar (desktop only)
-                  if (Platform.isWindows ||
-                      Platform.isMacOS ||
-                      Platform.isLinux)
-                    CustomTitleBar(
-                      isLight: Theme.of(context).brightness == Brightness.light,
-                    ),
-                  // Top bar
+                  // Titre bar + tab bar
+                  if (Platform.isWindows || Platform.isMacOS || Platform.isLinux)
+                    CustomTitleBar(isLight: Theme.of(context).brightness == Brightness.light),
+                  // Tab selector
                   Padding(
-                    padding: const EdgeInsets.fromLTRB(40, 24, 40, 0),
+                    padding: const EdgeInsets.fromLTRB(24, 16, 24, 0),
                     child: Row(
                       children: [
-                        Expanded(child: _buildStatusBadge()),
-                        const SizedBox(width: 20),
-                        if (_selectedDevice != null) _buildSendButton(),
+                        _buildTabButton(0, Icons.send_rounded, 'Envoi'),
+                        const SizedBox(width: 8),
+                        _buildTabButton(1, Icons.settings_outlined, 'Paramètres'),
+                        const Spacer(),
+                        if (_selectedTab == 0) ...[
+                          Expanded(child: _buildStatusBadge()),
+                          const SizedBox(width: 16),
+                          if (_selectedDevice != null) _buildSendButton(),
+                        ],
                       ],
                     ),
                   ),
-                  const SizedBox(height: 24),
-                  // Files area
+                  const SizedBox(height: 16),
+                  // Contenu de l'onglet sélectionné
                   Expanded(
-                    child: Padding(
-                      padding: const EdgeInsets.fromLTRB(40, 0, 40, 32),
-                      child: _buildFilesCard(isMobile: false),
-                    ),
+                    child: _selectedTab == 0
+                        ? Padding(
+                            padding: const EdgeInsets.fromLTRB(24, 0, 24, 24),
+                            child: _buildFilesCard(isMobile: false),
+                          )
+                        : SettingsScreen(
+                            themeService: context.read<ThemeService>(),
+                            receiveDirectoryPath: _receiveDirectoryPath,
+                            onOpenReceiveDirectory: _openReceiveDirectory,
+                          ),
                   ),
                 ],
               ),
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildTabButton(int index, IconData icon, String label) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final selected = _selectedTab == index;
+    return GestureDetector(
+      onTap: () => setState(() => _selectedTab = index),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 180),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(10),
+          color: selected ? colorScheme.primary.withAlpha(15) : Colors.transparent,
+          border: Border.all(
+            color: selected ? colorScheme.primary.withAlpha(60) : Colors.transparent,
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 16, color: selected ? colorScheme.primary : colorScheme.onSurfaceVariant),
+            const SizedBox(width: 6),
+            Text(
+              label,
+              style: GoogleFonts.plusJakartaSans(
+                fontSize: 13,
+                fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                color: selected ? colorScheme.primary : colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -1718,305 +1559,6 @@ class _HomeScreenState extends State<HomeScreen>
       ),
     );
   }
-
-  Widget _buildSidebarFooter() {
-    final colorScheme = Theme.of(context).colorScheme;
-    return Column(
-      children: [
-        if (_receiveDirectoryPath != null)
-          InkWell(
-            onTap: _openReceiveDirectory,
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Icon(
-                        Icons.folder_open_rounded,
-                        size: 18,
-                        color: colorScheme.onSurfaceVariant,
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Text(
-                          'Dossier de réception',
-                          style: GoogleFonts.plusJakartaSans(
-                            fontSize: 13,
-                            fontWeight: FontWeight.w500,
-                            color: colorScheme.onSurfaceVariant,
-                          ),
-                        ),
-                      ),
-                      Icon(
-                        Icons.chevron_right_rounded,
-                        size: 16,
-                        color: colorScheme.onSurfaceVariant,
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 6),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(6),
-                      color: colorScheme.onSurface.withAlpha(8),
-                    ),
-                    child: Text(
-                      _receiveDirectoryPath!,
-                      style: TextStyle(
-                        fontSize: 10,
-                        color: colorScheme.onSurfaceVariant,
-                        fontFamily: 'monospace',
-                      ),
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        const Divider(height: 1),
-        InkWell(
-          onTap: () => _showAbout(),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
-            child: Row(
-              children: [
-                Icon(
-                  Icons.person_outline,
-                  size: 18,
-                  color: colorScheme.onSurfaceVariant,
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Text(
-                    'À propos',
-                    style: GoogleFonts.plusJakartaSans(
-                      fontSize: 13,
-                      fontWeight: FontWeight.w500,
-                      color: colorScheme.onSurfaceVariant,
-                    ),
-                  ),
-                ),
-                Icon(
-                  Icons.chevron_right_rounded,
-                  size: 16,
-                  color: colorScheme.onSurfaceVariant,
-                ),
-              ],
-            ),
-          ),
-        ),
-        const Divider(height: 1),
-        InkWell(
-          onTap: () => _showThemeDialog(context),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
-            child: Row(
-              children: [
-                Icon(
-                  Icons.brightness_medium,
-                  size: 18,
-                  color: colorScheme.onSurfaceVariant,
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Text(
-                    'Thème',
-                    style: GoogleFonts.plusJakartaSans(
-                      fontSize: 13,
-                      fontWeight: FontWeight.w500,
-                      color: colorScheme.onSurfaceVariant,
-                    ),
-                  ),
-                ),
-                Icon(
-                  Icons.chevron_right_rounded,
-                  size: 16,
-                  color: colorScheme.onSurfaceVariant,
-                ),
-              ],
-            ),
-          ),
-        ),
-        const SizedBox(height: 8),
-      ],
-    );
-  }
-
-  void _showThemeDialog(BuildContext context) {
-    final isMobile = MediaQuery.of(context).size.width <= 800;
-    if (isMobile) {
-      _showThemeBottomSheet(context);
-    } else {
-      _showThemeDesktopDialog(context);
-    }
-  }
-
-  void _showThemeBottomSheet(BuildContext context) {
-    final themeService = context.read<ThemeService>();
-
-    showDialog(
-      context: context,
-      barrierColor: Colors.black26,
-      builder: (ctx) {
-        final colorScheme = Theme.of(ctx).colorScheme;
-        final modes = [
-          (AppThemeMode.system, Icons.brightness_auto, 'Système', 'Utilise le thème du système'),
-          (AppThemeMode.light, Icons.wb_sunny, 'Clair', 'Thème clair'),
-          (AppThemeMode.dark, Icons.nightlight_round, 'Sombre', 'Thème sombre'),
-        ];
-        return AlertDialog(
-          backgroundColor: colorScheme.surface,
-          shape: const RoundedRectangleBorder(
-            borderRadius: BorderRadius.all(Radius.circular(20)),
-          ),
-          titlePadding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
-          contentPadding: EdgeInsets.zero,
-          title: Row(
-            children: [
-              const Icon(Icons.palette_outlined, size: 18),
-              const SizedBox(width: 10),
-              Text(
-                'Apparence',
-                style: GoogleFonts.plusJakartaSans(
-                  fontSize: 15,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-            ],
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Divider(height: 1),
-              ...modes.map((item) {
-                final (mode, icon, label, subtitle) = item;
-                final selected = themeService.themeMode == mode;
-                return ListTile(
-                  leading: Icon(
-                    icon,
-                    color: selected
-                        ? colorScheme.primary
-                        : colorScheme.onSurfaceVariant,
-                  ),
-                  title: Text(
-                    label,
-                    style: GoogleFonts.plusJakartaSans(
-                      fontSize: 14,
-                      fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
-                      color: selected
-                          ? colorScheme.primary
-                          : colorScheme.onSurface,
-                    ),
-                  ),
-                  subtitle: Text(
-                    subtitle,
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: colorScheme.onSurfaceVariant,
-                    ),
-                  ),
-                  trailing: selected
-                      ? Icon(Icons.check_rounded, size: 18, color: colorScheme.primary)
-                      : null,
-                  onTap: () async {
-                    await themeService.setThemeMode(mode);
-                    if (ctx.mounted) Navigator.pop(ctx);
-                  },
-                );
-              }),
-              const SizedBox(height: 4),
-            ],
-          ),
-        );
-      },
-    );
-  }
-
-  void _showThemeDesktopDialog(BuildContext context) {
-    final themeService = context.read<ThemeService>();
-
-    showDialog(
-      context: context,
-      barrierColor: Colors.black26,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setInner) {
-          final colorScheme = Theme.of(ctx).colorScheme;
-          final modes = [
-            (AppThemeMode.system, Icons.brightness_auto, 'Système'),
-            (AppThemeMode.light, Icons.wb_sunny_outlined, 'Clair'),
-            (AppThemeMode.dark, Icons.nightlight_outlined, 'Sombre'),
-          ];
-          return AlertDialog(
-            backgroundColor: colorScheme.surface,
-            shape: const RoundedRectangleBorder(
-              borderRadius: BorderRadius.all(Radius.circular(20)),
-            ),
-            titlePadding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
-            contentPadding: EdgeInsets.zero,
-            title: Row(
-              children: [
-                const Icon(Icons.palette_outlined, size: 18),
-                const SizedBox(width: 10),
-                Text(
-                  'Apparence',
-                  style: GoogleFonts.plusJakartaSans(
-                    fontSize: 15,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-              ],
-            ),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Divider(height: 1),
-                ...modes.map((item) {
-                  final (mode, icon, label) = item;
-                  final selected = themeService.themeMode == mode;
-                  return ListTile(
-                    leading: Icon(
-                      icon,
-                      color: selected
-                          ? colorScheme.primary
-                          : colorScheme.onSurfaceVariant,
-                    ),
-                    title: Text(
-                      label,
-                      style: GoogleFonts.plusJakartaSans(
-                        fontSize: 14,
-                        fontWeight: selected
-                            ? FontWeight.w600
-                            : FontWeight.w400,
-                        color: selected
-                            ? colorScheme.primary
-                            : colorScheme.onSurface,
-                      ),
-                    ),
-                    trailing: selected
-                        ? Icon(Icons.check_rounded,
-                            size: 18, color: colorScheme.primary)
-                        : null,
-                    onTap: () async {
-                      await themeService.setThemeMode(mode);
-                      setInner(() {});
-                      if (ctx.mounted) Navigator.pop(ctx);
-                    },
-                  );
-                }),
-                const SizedBox(height: 4),
-              ],
-            ),
-          );
-        },
-      ),
-    );
-  }
-
 
   // ─────────────── STATUS CARD (Mobile) ───────────────
 
@@ -2386,7 +1928,7 @@ class _HomeScreenState extends State<HomeScreen>
                           color: colorScheme.outlineVariant,
                         ),
                       ),
-                      // Barre de progression — couleur primaire unie
+                      // Barre de progression - couleur primaire unie
                       AnimatedFractionallySizedBox(
                         duration: const Duration(milliseconds: 300),
                         widthFactor: _progress,
@@ -2737,6 +2279,7 @@ class _HomeScreenState extends State<HomeScreen>
 
   Widget _buildLocalDeviceCard(bool isMobile) {
     final colorScheme = Theme.of(context).colorScheme;
+
     return Container(
       margin: isMobile ? null : const EdgeInsets.symmetric(horizontal: 16),
       padding: EdgeInsets.symmetric(
@@ -2746,104 +2289,108 @@ class _HomeScreenState extends State<HomeScreen>
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(12),
         color: colorScheme.surface,
-        border: Border.all(color: colorScheme.outlineVariant),
+        border: Border.all(
+          color: colorScheme.outlineVariant,
+        ),
       ),
-      child: Row(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
-          Container(
-            width: 36,
-            height: 36,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              color: colorScheme.primary.withAlpha(20),
-            ),
-            child: Icon(
-              _iconForOs(Platform.operatingSystem),
-              size: isMobile ? 16 : 18,
-              color: colorScheme.primary,
-            ),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  widget.localDeviceName,
-                  style: GoogleFonts.plusJakartaSans(
-                    fontSize: isMobile ? 13 : 12,
-                    fontWeight: FontWeight.w700,
-                    color: colorScheme.onSurface,
-                  ),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
+          Row(
+            children: [
+              Container(
+                width: 36,
+                height: 36,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: colorScheme.primary.withAlpha(20),
                 ),
-                const SizedBox(height: 2),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(4),
-                    color: colorScheme.onSurface.withAlpha(8),
-                  ),
-                  child: Text(
-                    widget.localIpAddress,
-                    style: GoogleFonts.jetBrainsMono(
-                      fontSize: isMobile ? 11 : 10,
-                      color: colorScheme.onSurfaceVariant,
-                      fontWeight: FontWeight.w500,
-                    ),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
+                child: Icon(
+                  _iconForOs(Platform.operatingSystem),
+                  size: isMobile ? 16 : 18,
+                  color: colorScheme.primary,
                 ),
-                const SizedBox(height: 4),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(4),
-                    color: colorScheme.primary.withAlpha(12),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(
-                        Icons.fingerprint,
-                        size: 10,
-                        color: colorScheme.primary,
-                      ),
-                      const SizedBox(width: 4),
-                      Text(
-                        widget.localDeviceId.length >= 8
-                            ? widget.localDeviceId.substring(0, 8).toUpperCase()
-                            : widget.localDeviceId.toUpperCase(),
-                        style: GoogleFonts.jetBrainsMono(
-                          fontSize: 9,
-                          fontWeight: FontWeight.w400,
-                          color: colorScheme.primary.withAlpha(180),
-                          letterSpacing: 0.3,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-          ),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(10),
-              color: colorScheme.primary.withAlpha(15),
-            ),
-            child: Text(
-              'Moi',
-              style: TextStyle(
-                fontSize: 10,
-                fontWeight: FontWeight.bold,
-                color: colorScheme.primary,
               ),
-            ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      widget.localDeviceName,
+                      style: GoogleFonts.plusJakartaSans(
+                        fontSize: isMobile ? 13 : 12,
+                        fontWeight: FontWeight.w700,
+                        color: colorScheme.onSurface,
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    const SizedBox(height: 2),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(4),
+                        color: colorScheme.onSurface.withAlpha(8),
+                      ),
+                      child: Text(
+                        widget.localIpAddress,
+                        style: GoogleFonts.jetBrainsMono(
+                          fontSize: isMobile ? 11 : 10,
+                          color: colorScheme.onSurfaceVariant,
+                          fontWeight: FontWeight.w500,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(4),
+                        color: colorScheme.primary.withAlpha(12),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.fingerprint, size: 10, color: colorScheme.primary),
+                          const SizedBox(width: 4),
+                          Text(
+                            widget.localDeviceId.length >= 8
+                                ? widget.localDeviceId.substring(0, 8).toUpperCase()
+                                : widget.localDeviceId.toUpperCase(),
+                            style: GoogleFonts.jetBrainsMono(
+                              fontSize: 9,
+                              fontWeight: FontWeight.w400,
+                              color: colorScheme.primary.withAlpha(180),
+                              letterSpacing: 0.3,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              // Badge droite : Moi
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(10),
+                  color: colorScheme.primary.withAlpha(15),
+                ),
+                child: Text(
+                  'Moi',
+                  style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold,
+                    color: colorScheme.primary,
+                  ),
+                ),
+              ),
+            ],
           ),
         ],
       ),
@@ -3194,127 +2741,6 @@ class AnimatedFractionallySizedBoxState
       alignment: Alignment.centerLeft,
       widthFactor: _widthTween?.evaluate(animation) ?? widget.widthFactor,
       child: widget.child,
-    );
-  }
-}
-
-// ─────────────── PAGE À PROPOS (MOBILE) ───────────────
-
-class _AboutPage extends StatelessWidget {
-  const _AboutPage();
-
-  @override
-  Widget build(BuildContext context) {
-    final colorScheme = Theme.of(context).colorScheme;
-    return Scaffold(
-      appBar: AppBar(
-        title: Text(
-          'À propos',
-          style: GoogleFonts.plusJakartaSans(fontWeight: FontWeight.w700),
-        ),
-      ),
-      body: SafeArea(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            children: [
-              // App icon
-              Container(
-                width: 72,
-                height: 72,
-                decoration: BoxDecoration(
-                  color: colorScheme.primaryContainer,
-                  borderRadius: BorderRadius.circular(18),
-                ),
-                child: Icon(
-                  Icons.swap_horiz_rounded,
-                  size: 36,
-                  color: colorScheme.primary,
-                ),
-              ),
-              const SizedBox(height: 20),
-              Text(
-                'GoSend',
-                style: GoogleFonts.plusJakartaSans(
-                  fontWeight: FontWeight.w800,
-                  fontSize: 28,
-                ),
-              ),
-              const SizedBox(height: 4),
-              Text(
-                'P2P File Transfer Pro',
-                style: TextStyle(
-                  fontSize: 14,
-                  color: colorScheme.onSurfaceVariant,
-                ),
-              ),
-              const SizedBox(height: 28),
-              // Info card
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(20),
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(16),
-                  color: colorScheme.onSurface.withAlpha(5),
-                ),
-                child: Column(
-                  children: [
-                    _aboutRow(Icons.person_outline, 'Développeur', 'HOUNNOU Déo-Gratias', colorScheme),
-                    const Divider(height: 24),
-                    _aboutRow(Icons.cake_outlined, 'Année de naissance', '2007', colorScheme),
-                    const Divider(height: 24),
-                    _aboutRow(Icons.event_available, 'Projet finalisé', 'Lundi 6 juillet 2026', colorScheme),
-                    const Divider(height: 24),
-                    _aboutRow(Icons.language, 'Portfolio', 'deo-gratias.pages.dev', colorScheme),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 24),
-              FilledButton(
-                onPressed: () => Navigator.pop(context),
-                style: FilledButton.styleFrom(
-                  minimumSize: const Size(double.infinity, 50),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                ),
-                child: const Text('Fermer'),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _aboutRow(IconData icon, String label, String value, ColorScheme colorScheme) {
-    return Row(
-      children: [
-        Icon(icon, size: 20, color: colorScheme.onSurfaceVariant),
-        const SizedBox(width: 14),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                label,
-                style: TextStyle(
-                  fontSize: 11,
-                  color: colorScheme.onSurfaceVariant,
-                ),
-              ),
-              Text(
-                value,
-                style: GoogleFonts.plusJakartaSans(
-                  fontSize: 15,
-                  fontWeight: FontWeight.w600,
-                  color: colorScheme.onSurface,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ],
     );
   }
 }

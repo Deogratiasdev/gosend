@@ -11,9 +11,9 @@ import 'package:uuid/uuid.dart';
 import 'package:window_manager/window_manager.dart';
 
 import 'core/network/discovery_service.dart';
+import 'core/network/http_transfer_service.dart';
 import 'core/network/network_util.dart';
 import 'core/notifications/notification_service.dart';
-import 'core/security/encryption_service.dart';
 import 'core/theme/theme_service.dart';
 import 'models/device.dart';
 import 'ui/screens/home_screen.dart';
@@ -22,7 +22,6 @@ import 'ui/theme.dart';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Configure window for desktop platforms
   if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) {
     await windowManager.ensureInitialized();
 
@@ -88,7 +87,6 @@ class _GoSendAppState extends State<GoSendApp> {
       debugPrint('Services init error: $e');
     }
 
-    // Surveille l'IP et le nom toutes les 10 secondes
     _networkMonitorTimer = Timer.periodic(const Duration(seconds: 10), (_) {
       _checkNetworkChange();
     });
@@ -109,12 +107,6 @@ class _GoSendAppState extends State<GoSendApp> {
     }
   }
 
-  /// Récupère le nom de l'appareil et l'IP locale actuelle.
-  ///
-  /// CAS CRITIQUE : téléphone connecté au WiFi ET hotspot actif.
-  /// getWifiIP() retourne l'IP WiFi (ex: 192.168.1.100) mais les clients
-  /// hotspot ne peuvent joindre que l'IP hotspot (ex: 192.168.43.1).
-  /// On détecte donc si on est hôte hotspot et on override l'IP.
   Future<({String name, String ip})> _fetchNetworkInfo() async {
     String deviceName = _localDeviceName;
     String ipAddress = 'Non disponible';
@@ -139,16 +131,10 @@ class _GoSendAppState extends State<GoSendApp> {
       debugPrint('Error getting IP: $e');
     }
 
-    // Fallback : getWifiIP() retourne souvent null en mode hotspot Android
-    // (interface STA éteinte). On énumère alors les interfaces pour trouver
-    // l'IP hotspot (ex: 192.168.43.1).
     if (ipAddress.isEmpty || ipAddress == 'Non disponible') {
       ipAddress = await NetworkUtil.detectLocalIp();
     }
 
-    // CAS WiFi + Hotspot : getWifiIP() retourne l'IP WiFi, mais si on est
-    // aussi hôte hotspot, les clients hotspot ne peuvent joindre que l'IP
-    // hotspot. On détecte et override.
     if (ipAddress != 'Non disponible' && await NetworkUtil.isHotspotHost()) {
       final hotspotIp = await NetworkUtil.detectLocalIp();
       if (hotspotIp != 'Non disponible' && hotspotIp != ipAddress) {
@@ -160,7 +146,7 @@ class _GoSendAppState extends State<GoSendApp> {
     return (name: deviceName, ip: ipAddress);
   }
 
-  /// Vérifie si IP ou nom ont changé et redémarre la découverte si nécessaire
+  /// Vérifie si IP ou nom ont changé → redémarre découverte + re-lock.
   Future<void> _checkNetworkChange() async {
     final info = await _fetchNetworkInfo();
     final bool changed =
@@ -175,26 +161,38 @@ class _GoSendAppState extends State<GoSendApp> {
         });
       }
       _discoveryService.updateLocalInfo(name: info.name, ipAddress: info.ip);
-      // Redémarre la découverte avec la nouvelle IP/nom
       await _discoveryService.stopDiscovery();
       await _discoveryService.startDiscovery();
     }
   }
 
+  /// Comparaison silencieuse : évite un rebuild complet quand la
+  /// détection notifie sans changement réel de contenu.
+  bool _sameDevices(List<Device> a, List<Device> b) {
+    if (a.length != b.length) return false;
+    for (int i = 0; i < a.length; i++) {
+      final x = a[i];
+      final y = b[i];
+      if (x.id != y.id ||
+          x.name != y.name ||
+          x.ip != y.ip ||
+          x.os != y.os ||
+          x.httpPort != y.httpPort) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   Future<void> _initServices() async {
     final String os = Platform.operatingSystem;
 
-    // ID persistant : genere une fois, stocke dans SharedPreferences.
-    // Survit aux redemarrages -> identification fiable meme en multi-interface.
     final prefs = await SharedPreferences.getInstance();
     String deviceId = prefs.getString('device_id') ?? '';
     if (deviceId.isEmpty) {
       deviceId = const Uuid().v4();
       await prefs.setString('device_id', deviceId);
     }
-
-    // Init encryption service singleton
-    await EncryptionService.instance.init();
 
     _localOs = os;
     _localDeviceId = deviceId;
@@ -203,23 +201,51 @@ class _GoSendAppState extends State<GoSendApp> {
     _localDeviceName = info.name;
     _localIpAddress = info.ip;
 
+    // Nettoyage des .deogratias orphelins de la session précédente.
+    _cleanupOrphanedFiles();
+
     _discoveryService = DiscoveryService(
       localDeviceId: deviceId,
       localDeviceName: info.name,
       localOs: os,
       localIpAddress: info.ip,
-      encryptionService: EncryptionService.instance,
     );
 
     _discoveryService.discoveredDevices.addListener(() {
-      if (mounted) {
-        setState(() {
-          _devices = _discoveryService.discoveredDevices.value;
-        });
-      }
+      if (!mounted) return;
+      // Garde-fou silencieux : le service ne notifie déjà que sur
+      // changement réel, mais on évite tout rebuild inutile ici aussi.
+      final next = _discoveryService.discoveredDevices.value;
+      if (_sameDevices(_devices, next)) return;
+      setState(() {
+        _devices = next;
+      });
     });
 
     await _discoveryService.startDiscovery();
+  }
+
+  /// Supprime les fichiers .deogratias laissés par un crash ou une fermeture brutale.
+  void _cleanupOrphanedFiles() {
+    // On lance en arrière-plan sans bloquer l'initialisation.
+    _resolveReceiveDirPath().then((path) {
+      if (path != null) {
+        HttpTransferService.cleanupOrphanedPartFiles(path);
+      }
+    });
+  }
+
+  Future<String?> _resolveReceiveDirPath() async {
+    try {
+      if (Platform.isAndroid) {
+        return '/storage/emulated/0/Download/GoSend/received';
+      }
+      // Sur les autres plateformes on ne connait pas le chemin exact ici,
+      // HomeScreen s'en charge à son init.
+      return null;
+    } catch (_) {
+      return null;
+    }
   }
 
   @override
@@ -250,7 +276,6 @@ class _GoSendAppState extends State<GoSendApp> {
                     localOs: _localOs,
                     discoveryService: _discoveryService,
                     onRefresh: () async {
-                      // Rafraîchissement manuel : met à jour IP + nom + redémarre découverte
                       final info = await _fetchNetworkInfo();
                       if (mounted) {
                         setState(() {

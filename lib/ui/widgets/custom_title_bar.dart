@@ -34,7 +34,7 @@ class CustomTitleBar extends StatelessWidget {
         child: Row(
           children: [
             const SizedBox(width: 16),
-            // App icon — couleur primaire unie
+            // App icon - couleur primaire unie
             Container(
               width: 20,
               height: 20,

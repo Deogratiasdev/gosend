@@ -6,7 +6,6 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 import '../../models/device.dart';
-import '../security/encryption_service.dart';
 import 'network_util.dart';
 
 class DiscoveryService {
@@ -38,9 +37,6 @@ class DiscoveryService {
   final Map<String, Device> _devicesMap = {};
   final Map<String, DateTime> _lastSeenMap = {};
 
-  /// Service de chiffrement pour les messages broadcast
-  final EncryptionService _encryptionService;
-
   final String localDeviceId;
   String localDeviceName;
   final String localOs;
@@ -51,14 +47,7 @@ class DiscoveryService {
     required this.localDeviceName,
     required this.localOs,
     required this.localIpAddress,
-    EncryptionService? encryptionService,
-  }) : _encryptionService = encryptionService ?? EncryptionService.instance;
-
-  /// Update the encryption service (call after key is set)
-  void setEncryptionService(EncryptionService service) {
-    // Service is final, but we use a reference that can be updated
-    debugPrint('Encryption service linked to discovery');
-  }
+  });
 
   // ─────────────── START / STOP ───────────────
 
@@ -184,14 +173,7 @@ class DiscoveryService {
       'httpPort': 41732,
     });
 
-    // Encrypt message if key is set
-    String bufferStr;
-    if (_encryptionService.isKeySet) {
-      bufferStr = _encryptionService.encrypt(message) ?? message;
-    } else {
-      bufferStr = message;
-    }
-    final buffer = utf8.encode(bufferStr);
+    final buffer = utf8.encode(message);
 
     // 1) Directed broadcasts sur chaque interface
     try {
@@ -386,15 +368,7 @@ class DiscoveryService {
 
   void _handleIncomingDatagram(Datagram datagram) {
     try {
-      var message = utf8.decode(datagram.data);
-
-      // Try to decrypt if encrypted
-      if (_encryptionService.isEncrypted(message)) {
-        final decrypted = _encryptionService.safeDecrypt(message);
-        if (decrypted != message) {
-          message = decrypted;
-        }
-      }
+      final message = utf8.decode(datagram.data);
 
       final data = jsonDecode(message);
 
@@ -446,10 +420,30 @@ class DiscoveryService {
 
   // ─────────────── HELPERS ───────────────
 
+  /// Mise à jour silencieuse : ne notifie que si le contenu change
+  /// (sinon chaque broadcast reconstruisait toute l'UI toutes les 1,5s).
   void _updateDiscoveredDevices() {
-    discoveredDevices.value = _devicesMap.values
+    final next = _devicesMap.values
         .where((device) => !_isLocalDevice(device))
         .toList();
+    if (_sameDeviceList(discoveredDevices.value, next)) return;
+    discoveredDevices.value = next;
+  }
+
+  bool _sameDeviceList(List<Device> a, List<Device> b) {
+    if (a.length != b.length) return false;
+    for (int i = 0; i < a.length; i++) {
+      final x = a[i];
+      final y = b[i];
+      if (x.id != y.id ||
+          x.name != y.name ||
+          x.ip != y.ip ||
+          x.os != y.os ||
+          x.httpPort != y.httpPort) {
+        return false;
+      }
+    }
+    return true;
   }
 
   bool _isLocalDatagram(Map<String, dynamic> data, String senderIp) {

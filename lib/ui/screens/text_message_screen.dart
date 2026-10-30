@@ -27,7 +27,7 @@ class TextMessageScreen extends StatelessWidget {
               style: GoogleFonts.plusJakartaSans(fontWeight: FontWeight.w700),
             ),
             Text(
-              '${timestamp.hour.toString().padLeft(2, '0')}:${timestamp.minute.toString().padLeft(2, '0')} — '
+              '${timestamp.hour.toString().padLeft(2, '0')}:${timestamp.minute.toString().padLeft(2, '0')} - '
               '${timestamp.day.toString().padLeft(2, '0')}/${timestamp.month.toString().padLeft(2, '0')}/${timestamp.year}',
               style: TextStyle(
                 fontSize: 12,

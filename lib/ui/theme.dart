@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
-/// Thème GoSend — palette verte cohérente.
+/// Thème GoSend - palette verte cohérente.
 ///
 /// Rôle de chaque couleur (à respecter dans tout le code) :
 /// - primary (vert) : actions principales, boutons Envoyer, sélection.
